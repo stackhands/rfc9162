@@ -49,8 +49,14 @@ pub struct Sidecar {
 
 impl Sidecar {
     /// The sidecar over a bundle's entries with the log's key function.
-    #[must_use]
-    pub fn build<E: AsRef<[u8]>>(entries: &[E], keys: &KeyFn) -> Self {
+    /// A bundle wider than 256 entries is refused: the offset is one byte.
+    pub fn build<E: AsRef<[u8]>>(entries: &[E], keys: &KeyFn) -> Result<Self> {
+        if entries.len() > usize::from(u8::MAX) + 1 {
+            return Err(Error::OutOfRange(format!(
+                "bundle of {} entries exceeds 256",
+                entries.len()
+            )));
+        }
         let mut set: BTreeSet<(Vec<u8>, u8)> = BTreeSet::new();
         for (offset, entry) in entries.iter().enumerate() {
             let entry = entry.as_ref();
@@ -63,7 +69,7 @@ impl Sidecar {
         let distinct: BTreeSet<&[u8]> = pairs.iter().map(|(k, _)| k.as_slice()).collect();
         let distinct: Vec<&[u8]> = distinct.into_iter().collect();
         let filter = Bloom::build(&distinct, BITS_PER_KEY);
-        Self { pairs, filter }
+        Ok(Self { pairs, filter })
     }
 
     /// Offsets of the entries carrying `key`, ascending.
@@ -89,20 +95,31 @@ impl Sidecar {
         ))
     }
 
-    /// The sidecar as bytes.
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// The sidecar as bytes. A pair count or a key that does not fit in the
+    /// u16 length prefix is refused, rather than written truncated.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let filter = self.filter.to_bytes();
+        let count = u16::try_from(self.pairs.len()).map_err(|_| {
+            Error::Format(format!(
+                "sidecar has {} pairs, and the format holds 65535",
+                self.pairs.len()
+            ))
+        })?;
+        let filter_len = u32::try_from(filter.len())
+            .map_err(|_| Error::Format("sidecar filter exceeds 4 GiB".to_string()))?;
         let mut out = vec![VERSION];
-        out.extend_from_slice(&(self.pairs.len() as u16).to_be_bytes());
-        out.extend_from_slice(&(filter.len() as u32).to_be_bytes());
+        out.extend_from_slice(&count.to_be_bytes());
+        out.extend_from_slice(&filter_len.to_be_bytes());
         out.extend_from_slice(&filter);
         for (key, offset) in &self.pairs {
-            out.extend_from_slice(&(key.len() as u16).to_be_bytes());
+            let len = u16::try_from(key.len()).map_err(|_| {
+                Error::Format(format!("sidecar key of {} bytes exceeds 65535", key.len()))
+            })?;
+            out.extend_from_slice(&len.to_be_bytes());
             out.extend_from_slice(key);
             out.push(*offset);
         }
-        out
+        Ok(out)
     }
 
     /// The sidecar `to_bytes` wrote.
@@ -257,10 +274,10 @@ mod tests {
             .map(|i| format!("{}:{i}", i % 7).into_bytes())
             .collect();
         let keys: KeyFn = Box::new(|e| vec![e.split(|b| *b == b':').next().unwrap().to_vec()]);
-        let sidecar = Sidecar::build(&entries, &keys);
+        let sidecar = Sidecar::build(&entries, &keys).unwrap();
         // 256 identity keys and 256 caller keys, each pair once.
         assert_eq!(sidecar.pairs.len(), 512);
-        let bytes = sidecar.to_bytes();
+        let bytes = sidecar.to_bytes().unwrap();
         assert_eq!(Sidecar::from_bytes("s", &bytes).unwrap(), sidecar);
         for (offset, entry) in entries.iter().enumerate() {
             assert_eq!(sidecar.lookup(&identity(entry)), vec![offset as u8]);
@@ -278,8 +295,8 @@ mod tests {
 
     #[test]
     fn a_manifest_names_the_rows_holding_a_key() {
-        let sidecar = Sidecar::build(&[b"a".to_vec(), b"b".to_vec()], &no_keys());
-        let row = Manifest::row(0, &sidecar, &sidecar.to_bytes());
+        let sidecar = Sidecar::build(&[b"a".to_vec(), b"b".to_vec()], &no_keys()).unwrap();
+        let row = Manifest::row(0, &sidecar, &sidecar.to_bytes().unwrap());
         assert_eq!(row.keys, 2);
         let manifest = Manifest {
             version: 1,
@@ -290,5 +307,29 @@ mod tests {
         assert_eq!(manifest.candidates(max).count(), 1);
         assert_eq!(manifest.candidates(&[0u8; 32]).count(), 0);
         assert_eq!(manifest.candidates(&[0xffu8; 32]).count(), 0);
+    }
+
+    #[test]
+    fn a_sidecar_that_does_not_fit_its_length_prefixes_is_refused() {
+        let wide: Vec<Vec<u8>> = (0..257u16).map(|i| i.to_be_bytes().to_vec()).collect();
+        assert!(Sidecar::build(&wide, &no_keys()).is_err());
+
+        let pairs: Vec<(Vec<u8>, u8)> = (0..65_536u32)
+            .map(|i| (i.to_be_bytes().to_vec(), 0))
+            .collect();
+        let owned: Vec<Vec<u8>> = pairs.iter().map(|(key, _)| key.clone()).collect();
+        let sidecar = Sidecar {
+            pairs,
+            filter: Bloom::build(&owned, BITS_PER_KEY),
+        };
+        let err = sidecar.to_bytes().unwrap_err();
+        assert!(err.to_string().contains("65535"), "{err}");
+
+        let long = Sidecar {
+            pairs: vec![(vec![1u8; 65_536], 0)],
+            filter: Bloom::build(&[b"x".as_slice()], BITS_PER_KEY),
+        };
+        let err = long.to_bytes().unwrap_err();
+        assert!(err.to_string().contains("65535"), "{err}");
     }
 }

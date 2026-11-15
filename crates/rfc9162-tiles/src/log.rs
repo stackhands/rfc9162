@@ -271,8 +271,8 @@ impl<S: TileStore> Writer<S> {
             return Ok(());
         }
         for (index, bundle) in sealed {
-            let sidecar = Sidecar::build(bundle, &self.keys);
-            let bytes = sidecar.to_bytes();
+            let sidecar = Sidecar::build(bundle, &self.keys)?;
+            let bytes = sidecar.to_bytes()?;
             self.store.put(&index_path(*index), &bytes)?;
             self.manifest
                 .bundles
@@ -372,8 +372,8 @@ fn repair_index(store: &impl TileStore, keys: &KeyFn, frontier: &Frontier) -> Re
             reason: "missing".to_string(),
         })?;
         let entries = decode_bundle(&path, &bytes)?;
-        let sidecar = Sidecar::build(&entries, keys);
-        let bytes = sidecar.to_bytes();
+        let sidecar = Sidecar::build(&entries, keys)?;
+        let bytes = sidecar.to_bytes()?;
         if store.get(&index_path(index))?.as_deref() != Some(bytes.as_slice()) {
             store.put(&index_path(index), &bytes)?;
         }
