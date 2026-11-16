@@ -824,10 +824,11 @@ fn parse_index(body: &[u8], first: u64) -> Option<(u64, Vec<(String, Slot)>)> {
 
 /// Reads records from `valid_len` to the end of the file one at a time,
 /// applying each whose digest holds and stopping at the first that does
-/// not: a short read, a bad digest, a path that is not UTF-8, or a kind
-/// this version does not know.
+/// not: a head declaring more bytes than the file has, a short read, a bad
+/// digest, a path that is not UTF-8, or a kind this version does not know.
 fn scan(inner: &mut Inner) -> io::Result<()> {
     let mut at = inner.valid_len;
+    let end = inner.file.metadata()?.len();
     inner.file.seek(SeekFrom::Start(at))?;
     let mut reader = io::BufReader::new(inner.file.try_clone()?);
     let mut head = [0u8; HEAD_LEN];
@@ -842,6 +843,11 @@ fn scan(inner: &mut Inner) -> io::Result<()> {
         let path_len = u16::from_be_bytes([head[2], head[3]]) as usize;
         let stored_len = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
         let raw = u32::from_be_bytes([head[8], head[9], head[10], head[11]]);
+        // The lengths come from bytes a crash may have torn: the buffer is
+        // sized only for a record the file holds.
+        if at + (HEAD_LEN + path_len + stored_len + DIGEST_LEN) as u64 > end {
+            break;
+        }
         record.clear();
         record.extend_from_slice(&head);
         record.resize(HEAD_LEN + path_len + stored_len, 0);
