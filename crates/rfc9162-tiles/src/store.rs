@@ -2,9 +2,11 @@
 //! and an in-memory store for tests and single-process use.
 //!
 //! Paths are `/`-separated and relative to the store root. A write lands
-//! whole or not at all: the POSIX store writes a temporary file beside the
-//! target, syncs it, renames it over the path and syncs the directory, as
-//! Tessera's POSIX storage does.
+//! whole or not at all: the POSIX store writes a temporary file under the
+//! root's `.tmp`, syncs it, renames it over the path and syncs the
+//! directory, as Tessera's POSIX storage does. `create_new` links the
+//! temporary file at the path instead, which fails when something is
+//! there, so the root must be on a file system with hard links.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -19,8 +21,8 @@ pub trait TileStore {
     fn get(&self, path: &str) -> io::Result<Option<Vec<u8>>>;
     /// Writes `bytes` at `path`, whole or not at all, replacing what is there.
     fn put(&self, path: &str, bytes: &[u8]) -> io::Result<()>;
-    /// Writes `bytes` at `path` only when nothing is there; `false` when
-    /// something is.
+    /// Writes `bytes` at `path`, whole or not at all, only when nothing is
+    /// there; `false` when something is.
     fn create_new(&self, path: &str, bytes: &[u8]) -> io::Result<bool>;
     /// Removes `path`; `false` when there was nothing to remove.
     fn delete(&self, path: &str) -> io::Result<bool>;
@@ -199,14 +201,13 @@ impl TileStore for PosixStore {
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no parent"))?;
         fs::create_dir_all(parent)?;
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)
-        {
-            Ok(mut file) => {
-                file.write_all(bytes)?;
-                file.sync_all()?;
+        let temp = self.write_temp(bytes)?;
+        let linked = fs::hard_link(&temp, &target);
+        // The bytes are at the path or nowhere; the temporary name goes
+        // either way, and failing to remove it leaves only a stray file.
+        let _ = fs::remove_file(&temp);
+        match linked {
+            Ok(()) => {
                 Self::sync_dir(parent)?;
                 Ok(true)
             }
