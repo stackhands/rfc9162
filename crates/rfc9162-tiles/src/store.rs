@@ -339,3 +339,20 @@ impl TileStore for MemoryStore {
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_handles_on_one_root_never_share_a_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = PosixStore::open(dir.path()).unwrap();
+        let b = PosixStore::open(dir.path()).unwrap();
+        let from_a = a.write_temp(b"from a").unwrap();
+        let from_b = b.write_temp(b"from b").unwrap();
+        assert_ne!(from_a, from_b);
+        assert_eq!(fs::read(&from_a).unwrap(), b"from a");
+        assert_eq!(fs::read(&from_b).unwrap(), b"from b");
+    }
+}
