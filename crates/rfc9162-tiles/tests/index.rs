@@ -75,7 +75,10 @@ fn a_rebuilt_sidecar_is_the_written_one() {
 
     let reader = Reader::open(store.clone(), keys()).unwrap();
     for n in 0..2u64 {
-        let rebuilt = Sidecar::build(&reader.bundle(n).unwrap(), &keys()).to_bytes();
+        let rebuilt = Sidecar::build(&reader.bundle(n).unwrap(), &keys())
+            .unwrap()
+            .to_bytes()
+            .unwrap();
         assert_eq!(rebuilt, written[n as usize], "sidecar {n}");
     }
 

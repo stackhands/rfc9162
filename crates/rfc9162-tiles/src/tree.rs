@@ -368,8 +368,21 @@ impl<S: TileStore> TileHashReader<S> {
     /// The root of the perfect subtree over leaves `[start, start + 2^height)`,
     /// which must be aligned and inside the tree.
     pub fn perfect(&self, start: u64, height: u32) -> Result<Hash> {
+        // A shift of 64 or more panics, and a span that does not fit in a
+        // u64 is not a subtree of any tree this reader can name.
+        if height >= u64::BITS {
+            return Err(Error::OutOfRange(format!(
+                "perfect subtree at {start} of height {height} does not fit in a u64"
+            )));
+        }
         let span = 1u64 << height;
-        if start % span != 0 || start.saturating_add(span) > self.size {
+        let Some(end) = start.checked_add(span) else {
+            return Err(Error::OutOfRange(format!(
+                "perfect subtree at {start} of height {height} at size {}",
+                self.size
+            )));
+        };
+        if start % span != 0 || end > self.size {
             return Err(Error::OutOfRange(format!(
                 "perfect subtree at {start} of height {height} at size {}",
                 self.size
@@ -475,13 +488,17 @@ impl<S: TileStore> TileHashReader<S> {
 
 /// The largest power of two strictly below `width`, where RFC 9162 divides a
 /// tree of that width.
+///
+/// A width of 0 or 1 is not a tree this function divides; callers split only
+/// when the width is at least 2. Widths above `2^63` used to overflow the
+/// doubling loop, which panics in debug and does not terminate in release.
 #[must_use]
 pub fn split_point(width: u64) -> u64 {
-    let mut split = 1u64;
-    while split * 2 < width {
-        split *= 2;
+    if width <= 2 {
+        return 1;
     }
-    split
+    // Largest power of two that is <= width-1.
+    1u64 << (63 - (width - 1).leading_zeros())
 }
 
 #[cfg(test)]
@@ -495,6 +512,27 @@ mod tests {
         assert_eq!(split_point(4), 2);
         assert_eq!(split_point(5), 4);
         assert_eq!(split_point(257), 256);
+        assert_eq!(split_point(1u64 << 63), 1u64 << 62);
+        assert_eq!(split_point((1u64 << 63) + 1), 1u64 << 63);
+        assert_eq!(split_point(u64::MAX), 1u64 << 63);
+    }
+
+    #[test]
+    fn a_wide_tree_and_a_tall_subtree_are_refused_without_overflow() {
+        let store = crate::store::MemoryStore::new();
+        let wide = TileHashReader::new(store, (1u64 << 63) + 1, [0u8; 32]);
+        assert!(wide.inclusion_proof(0).is_err());
+
+        let store = crate::store::MemoryStore::new();
+        let reader = TileHashReader::new(store, u64::MAX, [0u8; 32]);
+        let tall = reader.perfect(0, 64).unwrap_err();
+        assert!(tall.to_string().contains("does not fit in a u64"), "{tall}");
+        // start + 2^63 does not fit, so the bounds check refuses before any tile read.
+        let overflow = reader.perfect(1u64 << 63, 63).unwrap_err();
+        assert!(
+            overflow.to_string().contains("perfect subtree"),
+            "{overflow}"
+        );
     }
 
     #[test]
