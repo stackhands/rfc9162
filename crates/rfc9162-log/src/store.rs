@@ -1100,8 +1100,14 @@ impl<S: TileStore> Store<S> {
     ) -> Result<RunManifest, Error> {
         let bytes = Run::encode_blocks(&entries, &pairs)?;
         let path = run_path(&entries);
-        if !self.manifest_store().create_new(&path, &bytes)? {
-            return Err(Error::Tree("a run for that entry range is already stored"));
+        let store = self.manifest_store();
+        // A seal or compaction whose manifest append failed, or was cut short
+        // by a crash, left its run file behind: the same bytes are that run,
+        // which only the manifest makes part of the log.
+        if !store.create_new(&path, &bytes)? && store.get(&path)?.as_deref() != Some(&bytes[..]) {
+            return Err(Error::Tree(
+                "another run for that entry range is already stored",
+            ));
         }
         let (key_lo, key_hi) = match (pairs.first(), pairs.last()) {
             (Some(first), Some(last)) => (first.0.clone(), last.0.clone()),
