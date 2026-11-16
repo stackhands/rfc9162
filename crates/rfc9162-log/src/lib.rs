@@ -123,8 +123,10 @@ pub struct Recovery {
     pub checkpoint_size: u64,
     /// Entries found beyond it and replayed into the tree.
     pub replayed: u64,
-    /// Entries found beyond it that could not be replayed (torn, or past a
-    /// gap) and were quarantined.
+    /// Store paths of the data log that its tree state did not cover (tiles
+    /// and bundles a crash left beyond the tree), which opening the store
+    /// moved to `.state/torn-<utc>`. A count of paths, not of entries; no
+    /// entry in them is in the recovered tree.
     pub quarantined: u64,
     /// The consistency path from the checkpoint's tree to the recovered one.
     pub consistency: Vec<[u8; 32]>,
