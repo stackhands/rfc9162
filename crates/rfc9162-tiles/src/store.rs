@@ -83,12 +83,15 @@ impl<T: TileStore + ?Sized> TileStore for Arc<T> {
     }
 }
 
+/// Numbers for temporary file names, drawn by every `PosixStore` in the
+/// process, so that two handles on one root never pick the same name.
+static TEMP_NUMBER: AtomicU64 = AtomicU64::new(0);
+
 /// A directory. Every path is resolved under the root; `..`, absolute paths
 /// and empty elements are refused.
 #[derive(Debug, Clone)]
 pub struct PosixStore {
     root: PathBuf,
-    counter: Arc<AtomicU64>,
 }
 
 impl PosixStore {
@@ -97,10 +100,7 @@ impl PosixStore {
         let root = root.into();
         fs::create_dir_all(&root)?;
         fs::create_dir_all(root.join(".tmp"))?;
-        Ok(Self {
-            root,
-            counter: Arc::new(AtomicU64::new(0)),
-        })
+        Ok(Self { root })
     }
 
     /// The directory the store lives in.
@@ -126,14 +126,27 @@ impl PosixStore {
         Ok(self.root.join(relative))
     }
 
+    /// A new file under `.tmp` holding `bytes`, synced. It is named after the
+    /// process id and a number from `TEMP_NUMBER`; a name that is taken, as
+    /// by an earlier process with the same id, is passed over rather than
+    /// truncated. A write that fails removes the file.
     fn write_temp(&self, bytes: &[u8]) -> io::Result<PathBuf> {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        let name = format!("{}-{n}", std::process::id());
-        let temp = self.root.join(".tmp").join(name);
-        let mut file = File::create(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        Ok(temp)
+        loop {
+            let n = TEMP_NUMBER.fetch_add(1, Ordering::Relaxed);
+            let name = format!("{}-{n}", std::process::id());
+            let temp = self.root.join(".tmp").join(name);
+            let mut file = match OpenOptions::new().write(true).create_new(true).open(&temp) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            };
+            if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                drop(file);
+                let _ = fs::remove_file(&temp);
+                return Err(e);
+            }
+            return Ok(temp);
+        }
     }
 
     fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -354,5 +367,28 @@ mod tests {
         assert_ne!(from_a, from_b);
         assert_eq!(fs::read(&from_a).unwrap(), b"from a");
         assert_eq!(fs::read(&from_b).unwrap(), b"from b");
+    }
+
+    #[test]
+    fn a_temporary_name_already_taken_is_passed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PosixStore::open(dir.path()).unwrap();
+        let next = TEMP_NUMBER.load(Ordering::Relaxed);
+        let taken: Vec<PathBuf> = (next..next + 3)
+            .map(|n| {
+                dir.path()
+                    .join(".tmp")
+                    .join(format!("{}-{n}", std::process::id()))
+            })
+            .collect();
+        for path in &taken {
+            fs::write(path, b"left behind").unwrap();
+        }
+        let temp = store.write_temp(b"new").unwrap();
+        assert!(!taken.contains(&temp));
+        assert_eq!(fs::read(&temp).unwrap(), b"new");
+        for path in &taken {
+            assert_eq!(fs::read(path).unwrap(), b"left behind");
+        }
     }
 }
