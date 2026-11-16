@@ -113,3 +113,44 @@ fn a_project_is_synced_snapshotted_and_read_back_from_the_shell() {
         Some(1)
     );
 }
+
+#[test]
+fn a_command_line_it_does_not_take_is_status_2_and_opens_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let p = project.to_str().unwrap();
+    let note = dir.path().join("child.note");
+    std::fs::write(&note, "not a note\n").unwrap();
+    let n = note.to_str().unwrap();
+    let mut wrong = Vec::new();
+    for args in [
+        vec!["frobnicate", "--dir", p],
+        vec!["history", "--dir", p],
+        vec!["tree", "--dir", p, "ten"],
+        vec!["diff", "--dir", p, "0"],
+        vec!["blob", "--dir", p],
+        vec!["snapshot", "--dir", p, "--origin", "example.org/etc"],
+        vec!["include", "--dir", p, "child", "--note", n],
+        vec![
+            "include",
+            "--dir",
+            p,
+            "child",
+            "--note",
+            n,
+            "--trusted",
+            "nokey",
+        ],
+    ] {
+        let status = cli(&args).status.code();
+        let opened = project.join(".sidecar").exists();
+        if status != Some(2) || opened {
+            wrong.push(format!(
+                "{args:?}: status {status:?}, sidecar opened {opened}"
+            ));
+        }
+        let _ = std::fs::remove_dir_all(project.join(".sidecar"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
