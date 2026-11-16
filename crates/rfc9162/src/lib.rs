@@ -72,7 +72,9 @@ fn split_point(width: usize) -> usize {
 pub struct Head {
     /// Number of entries the root covers.
     pub size: usize,
-    /// Merkle root, hex.
+    /// Merkle root, in the lower-case hex [`hex`] writes. The verify
+    /// functions compare roots as that text, so the same root in upper case
+    /// does not verify, and [`Head::material`] covers it as written.
     pub root: String,
 }
 
@@ -119,6 +121,8 @@ pub fn inclusion_proof(leaves: &[[u8; 32]], index: usize) -> Option<Vec<[u8; 32]
 }
 
 /// Whether `leaf` sits at `index` of a tree of `size` leaves with that root.
+/// `root_hex` is the lower-case hex [`hex`] writes, as in [`Head::root`];
+/// any other spelling of the root does not verify.
 #[must_use]
 pub fn verify_inclusion(
     leaf: &[u8; 32],
@@ -190,7 +194,9 @@ fn subproof(leaves: &[[u8; 32]], old: usize, known: bool) -> Vec<[u8; 32]> {
 }
 
 /// Whether the tree of `old` leaves with `old_root` is a prefix of the tree of
-/// `new` leaves with `new_root`; both roots are recomputed from `nodes`.
+/// `new` leaves with `new_root`; both roots are recomputed from `path`. Both
+/// are the lower-case hex [`hex`] writes, as in [`Head::root`]; any other
+/// spelling does not verify.
 #[must_use]
 pub fn verify_consistency(
     old: usize,
@@ -467,5 +473,41 @@ mod tests {
         assert_eq!(head.size, 0);
         assert_eq!(head.root.len(), 64);
         assert!(inclusion_proof(&[], 0).is_none());
+    }
+
+    /// A root is the lower-case hex a signature over [`Head::material`]
+    /// covers. The same root in upper case is not that head and verifies
+    /// nothing, on either path the consistency check takes.
+    #[test]
+    fn a_root_in_upper_case_does_not_verify() {
+        let all = leaves(12);
+        let later = Head::over(&all);
+        let upper = later.root.to_uppercase();
+        assert_ne!(upper, later.root);
+        let path = inclusion_proof(&all, 3).expect("a path");
+        assert!(verify_inclusion(&all[3], 3, 12, &path, &later.root));
+        assert!(!verify_inclusion(&all[3], 3, 12, &path, &upper));
+        for old in [4, 5] {
+            let earlier = Head::over(&all[..old]);
+            let proof = consistency_proof(&all, old).expect("a proof");
+            let earlier_upper = earlier.root.to_uppercase();
+            assert!(verify_consistency(
+                old,
+                &earlier.root,
+                12,
+                &later.root,
+                &proof
+            ));
+            assert!(!verify_consistency(
+                old,
+                &earlier_upper,
+                12,
+                &later.root,
+                &proof
+            ));
+            assert!(!verify_consistency(old, &earlier.root, 12, &upper, &proof));
+        }
+        assert!(!verify_consistency(12, &upper, 12, &later.root, &[]));
+        assert!(from_hex(&upper).is_none());
     }
 }
