@@ -1,6 +1,6 @@
 # rfc9162-sidecar
 
-The binary in the `rfc9162-log` crate. Its rustdoc page is [`rfc9162_sidecar`](../api/rfc9162_sidecar/index.html). The pack for `--dir DIR` is `DIR/.sidecar/pack`. Each command opens that pack, holds the writer lock while it runs, and prints one line per result. Exit status 0 means the command finished. Exit status 2 means the command line is rejected. Exit status 1 means the store or a proof failed.
+The binary in the `rfc9162-log` crate. Its rustdoc page is [`rfc9162_sidecar`](../api/rfc9162_sidecar/index.html). The pack for `--dir DIR` is `DIR/.sidecar/pack`. Each command opens that pack, holds the writer lock while it runs, and prints one line per result. Exit status 0 means the command finished. Exit status 2 means the command line is rejected; it is checked before the pack is opened, so nothing is created. Exit status 1 means the store or a proof failed.
 
 ```text
 rfc9162-sidecar init     --dir DIR
