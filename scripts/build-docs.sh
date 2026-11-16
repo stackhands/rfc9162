@@ -10,8 +10,13 @@ if ! command -v mdbook >/dev/null 2>&1; then
     exit 1
 fi
 
+# Wherever cargo puts its builds: CARGO_TARGET_DIR or a configured
+# target-dir moves them out of target/.
+target=$(cargo metadata --locked --format-version 1 --no-deps |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+
 export RUSTDOCFLAGS="-D warnings"
-rm -rf "$root/target/doc"
+rm -rf "$target/doc"
 cargo doc --locked --no-deps -p rfc9162 -p rfc9162-tiles -p rfc9162-log
 bash "$root/scripts/regen-doc-output.sh"
 
@@ -28,4 +33,4 @@ rm -f "$err"
 
 rm -rf "$root/docs/book/api"
 mkdir -p "$root/docs/book/api"
-cp -a "$root/target/doc/." "$root/docs/book/api/"
+cp -a "$target/doc/." "$root/docs/book/api/"

@@ -3,9 +3,13 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
-sidecar="$root/target/debug/rfc9162-sidecar"
-demo_key="$root/target/debug/demo_key"
-show="$root/target/debug/show_checkpoint"
+# Wherever cargo puts its builds: CARGO_TARGET_DIR or a configured
+# target-dir moves them out of target/.
+target=$(cd "$root" && cargo metadata --locked --format-version 1 --no-deps |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+sidecar="$target/debug/rfc9162-sidecar"
+demo_key="$target/debug/demo_key"
+show="$target/debug/show_checkpoint"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cd "$work"
