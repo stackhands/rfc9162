@@ -407,3 +407,22 @@ fn a_split_log_keeps_the_data_tree_as_the_entries_alone() {
     assert_eq!(reader.live_runs().len(), 1);
     assert_eq!(reader.find(b"module=m4").expect("find")[0].entry.index, 4);
 }
+
+#[test]
+fn a_sealed_run_is_written_in_format_v3() {
+    let memory = MemoryStore::new();
+    let mut store = Store::open(memory.clone(), fields()).expect("open");
+    for i in 0..5 {
+        store.append(&entry(i)).expect("append");
+    }
+    store.seal().expect("seal");
+    let runs: Vec<String> = memory
+        .list("runs")
+        .expect("list")
+        .into_iter()
+        .filter(|path| path != "runs/live")
+        .collect();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let bytes = memory.get(&runs[0]).expect("get").expect("the run");
+    assert!(bytes.starts_with(rfc9162_log::store::RUN_MAGIC_V3));
+}

@@ -17,13 +17,17 @@
 //!
 //! - `runs/<lo>-<hi>`: one sealed run, the sorted `(key, index)` pairs of
 //!   data entries `lo..=hi` and a Bloom filter over the keys, in the format
-//!   `RUN_MAGIC` describes. Its SHA-256 is the `run_hash` the logged manifest
-//!   carries, so a reader checks the file before trusting a seek. The writer
-//!   writes format v2: each key is stored as the length it shares with the
-//!   key before it and the bytes that follow (front coding), and each index
-//!   as a LEB128 varint offset from `lo`. Runs written as v1 (every key and
-//!   index in full) stay readable; the manifest binds the file's hash, not
-//!   its format.
+//!   [`RUN_MAGIC_V3`] describes. Its SHA-256 is the `run_hash` the logged
+//!   manifest carries, so a reader checks the file before trusting a seek.
+//!   The writer writes format v3: the pairs in blocks of [`BLOCK_PAIRS`],
+//!   behind an index of each block's first key, pair count and byte length,
+//!   so a lookup decodes only the blocks whose key range can hold the key.
+//!   Inside a block each key is stored as the length it shares with the key
+//!   before it and the bytes that follow (front coding, restarted at every
+//!   block), and each index as a LEB128 varint offset from `lo`. Runs
+//!   written as v2 (one front-coded sequence) or v1 (every key and index in
+//!   full) stay readable; the manifest binds the file's hash, not its
+//!   format.
 //! - `runs/live`: the manifest indices of the runs a lookup goes through, one
 //!   per line, oldest first. A cache: when it is missing or stale the live set
 //!   is rebuilt from the manifest entries in the log.
