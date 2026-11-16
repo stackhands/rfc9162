@@ -2,9 +2,11 @@
 //! and an in-memory store for tests and single-process use.
 //!
 //! Paths are `/`-separated and relative to the store root. A write lands
-//! whole or not at all: the POSIX store writes a temporary file beside the
-//! target, syncs it, renames it over the path and syncs the directory, as
-//! Tessera's POSIX storage does.
+//! whole or not at all: the POSIX store writes a temporary file under the
+//! root's `.tmp`, syncs it, renames it over the path and syncs the
+//! directory, as Tessera's POSIX storage does. `create_new` links the
+//! temporary file at the path instead, which fails when something is
+//! there, so the root must be on a file system with hard links.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -19,8 +21,8 @@ pub trait TileStore {
     fn get(&self, path: &str) -> io::Result<Option<Vec<u8>>>;
     /// Writes `bytes` at `path`, whole or not at all, replacing what is there.
     fn put(&self, path: &str, bytes: &[u8]) -> io::Result<()>;
-    /// Writes `bytes` at `path` only when nothing is there; `false` when
-    /// something is.
+    /// Writes `bytes` at `path`, whole or not at all, only when nothing is
+    /// there; `false` when something is.
     fn create_new(&self, path: &str, bytes: &[u8]) -> io::Result<bool>;
     /// Removes `path`; `false` when there was nothing to remove.
     fn delete(&self, path: &str) -> io::Result<bool>;
@@ -83,12 +85,15 @@ impl<T: TileStore + ?Sized> TileStore for Arc<T> {
     }
 }
 
+/// Numbers for temporary file names, drawn by every `PosixStore` in the
+/// process, so that two handles on one root never pick the same name.
+static TEMP_NUMBER: AtomicU64 = AtomicU64::new(0);
+
 /// A directory. Every path is resolved under the root; `..`, absolute paths
 /// and empty elements are refused.
 #[derive(Debug, Clone)]
 pub struct PosixStore {
     root: PathBuf,
-    counter: Arc<AtomicU64>,
 }
 
 impl PosixStore {
@@ -97,10 +102,7 @@ impl PosixStore {
         let root = root.into();
         fs::create_dir_all(&root)?;
         fs::create_dir_all(root.join(".tmp"))?;
-        Ok(Self {
-            root,
-            counter: Arc::new(AtomicU64::new(0)),
-        })
+        Ok(Self { root })
     }
 
     /// The directory the store lives in.
@@ -126,14 +128,27 @@ impl PosixStore {
         Ok(self.root.join(relative))
     }
 
+    /// A new file under `.tmp` holding `bytes`, synced. It is named after the
+    /// process id and a number from `TEMP_NUMBER`; a name that is taken, as
+    /// by an earlier process with the same id, is passed over rather than
+    /// truncated. A write that fails removes the file.
     fn write_temp(&self, bytes: &[u8]) -> io::Result<PathBuf> {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        let name = format!("{}-{n}", std::process::id());
-        let temp = self.root.join(".tmp").join(name);
-        let mut file = File::create(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        Ok(temp)
+        loop {
+            let n = TEMP_NUMBER.fetch_add(1, Ordering::Relaxed);
+            let name = format!("{}-{n}", std::process::id());
+            let temp = self.root.join(".tmp").join(name);
+            let mut file = match OpenOptions::new().write(true).create_new(true).open(&temp) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            };
+            if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                drop(file);
+                let _ = fs::remove_file(&temp);
+                return Err(e);
+            }
+            return Ok(temp);
+        }
     }
 
     fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -186,14 +201,13 @@ impl TileStore for PosixStore {
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no parent"))?;
         fs::create_dir_all(parent)?;
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)
-        {
-            Ok(mut file) => {
-                file.write_all(bytes)?;
-                file.sync_all()?;
+        let temp = self.write_temp(bytes)?;
+        let linked = fs::hard_link(&temp, &target);
+        // The bytes are at the path or nowhere; the temporary name goes
+        // either way, and failing to remove it leaves only a stray file.
+        let _ = fs::remove_file(&temp);
+        match linked {
+            Ok(()) => {
                 Self::sync_dir(parent)?;
                 Ok(true)
             }
@@ -337,5 +351,45 @@ impl TileStore for MemoryStore {
             .filter(|k| under(k, prefix))
             .cloned()
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_handles_on_one_root_never_share_a_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = PosixStore::open(dir.path()).unwrap();
+        let b = PosixStore::open(dir.path()).unwrap();
+        let from_a = a.write_temp(b"from a").unwrap();
+        let from_b = b.write_temp(b"from b").unwrap();
+        assert_ne!(from_a, from_b);
+        assert_eq!(fs::read(&from_a).unwrap(), b"from a");
+        assert_eq!(fs::read(&from_b).unwrap(), b"from b");
+    }
+
+    #[test]
+    fn a_temporary_name_already_taken_is_passed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PosixStore::open(dir.path()).unwrap();
+        let next = TEMP_NUMBER.load(Ordering::Relaxed);
+        let taken: Vec<PathBuf> = (next..next + 3)
+            .map(|n| {
+                dir.path()
+                    .join(".tmp")
+                    .join(format!("{}-{n}", std::process::id()))
+            })
+            .collect();
+        for path in &taken {
+            fs::write(path, b"left behind").unwrap();
+        }
+        let temp = store.write_temp(b"new").unwrap();
+        assert!(!taken.contains(&temp));
+        assert_eq!(fs::read(&temp).unwrap(), b"new");
+        for path in &taken {
+            assert_eq!(fs::read(path).unwrap(), b"left behind");
+        }
     }
 }
