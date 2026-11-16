@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use ed25519_dalek::SigningKey;
 use rfc9162::{hex, leaf_hash, verify_inclusion};
-use rfc9162_log::{Op, Sidecar};
+use rfc9162_log::{AuthenticatedLog, Op, Sidecar};
 use rfc9162_tiles::{Checkpoint, Note, PackStore, Signer, TileStore, Verifier};
 
 fn meta(actor: &str) -> BTreeMap<String, String> {
@@ -270,4 +270,10 @@ fn a_parent_logs_its_children_s_checkpoints_and_refuses_an_equivocation() {
     assert!(found[1].located.run.is_some());
     assert!(parent.tree_at(parent.size()).unwrap().is_empty());
     assert!(parent.under("stacks").unwrap().len() == 2);
+    // Each is also found by the child's origin.
+    let by_origin = parent.log().find(b"origin=example.org/stack").unwrap();
+    assert_eq!(
+        by_origin.iter().map(|l| l.entry.index).collect::<Vec<_>>(),
+        found.iter().map(|f| f.index).collect::<Vec<_>>()
+    );
 }

@@ -10,8 +10,9 @@
 //! [`rfc9162_tiles::PackStore`] the whole sidecar is one file and its lock.
 //!
 //! An entry is one JSON line, [`Change`], and its lookup keys are
-//! `path=<path>` and `blob=<hex>`, so a path's history is a point lookup
-//! and everything under a directory is a range over the sorted runs. A blob
+//! `path=<path>`, `blob=<hex>` for a put and `origin=<origin>` for a
+//! child's checkpoint, so a path's history is a point lookup and
+//! everything under a directory is a range over the sorted runs. A blob
 //! is stored once per content hash at `blob/<hex>` before the entry that
 //! names it is appended, so an entry never names a blob the store lacks.
 //! Entries are at most the tile log's entry length; file content goes in
@@ -80,8 +81,9 @@ pub struct Found {
     pub located: Located,
 }
 
-/// The lookup keys of a sidecar entry: `path=` and `blob=`. An entry that is
-/// not a sidecar change has no keys.
+/// The lookup keys of a sidecar entry: `path=`, `blob=` for a put and
+/// `origin=` for a checkpoint. An entry that is not a sidecar change has no
+/// keys.
 #[must_use]
 pub fn sidecar_keys() -> Keys {
     Arc::new(|entry: &[u8]| {
