@@ -289,8 +289,11 @@ impl<S: TileStore> Writer<S> {
 
     /// Signs the tree state as a C2SP checkpoint under `origin` and writes
     /// it at `checkpoint`, holding `.state/publish.lock` meanwhile. A
-    /// checkpoint already published for a larger size is never replaced, so
-    /// the signer never signs a checkpoint inconsistent with one it signed.
+    /// checkpoint already published under `origin` is replaced only by one
+    /// for a tree that extends it: the same root at its size, or a larger
+    /// tree the tiles prove consistent with it. A larger published size is
+    /// [`Error::OutOfRange`], any other tree [`Error::Corrupt`], so the
+    /// signer never signs a checkpoint inconsistent with one it signed.
     /// Returns the note.
     pub fn checkpoint(&self, signer: &Signer, origin: &str) -> Result<Note> {
         let body = format!("{}\n", std::process::id());
@@ -309,17 +312,56 @@ impl<S: TileStore> Writer<S> {
                 reason: "not UTF-8".to_string(),
             })?;
             let published = Checkpoint::parse(&Note::parse(&text)?.text)?;
-            if published.origin == origin && published.size > self.size() {
-                return Err(Error::OutOfRange(format!(
-                    "a checkpoint for size {} is published, the log is at {}",
-                    published.size,
-                    self.size()
-                )));
+            if published.origin == origin {
+                if published.size > self.size() {
+                    return Err(Error::OutOfRange(format!(
+                        "a checkpoint for size {} is published, the log is at {}",
+                        published.size,
+                        self.size()
+                    )));
+                }
+                if !self.extends(published.size, &published.root)? {
+                    return Err(Error::Corrupt {
+                        path: CHECKPOINT.to_string(),
+                        reason: format!(
+                            "the published tree of size {} and root {} is not a prefix of the log's tree of size {} and root {}",
+                            published.size,
+                            rfc9162::hex(&published.root),
+                            self.size(),
+                            rfc9162::hex(&self.root())
+                        ),
+                    });
+                }
             }
         }
         let note = signer.sign(&Checkpoint::new(origin, self.size(), self.root()));
         self.store.put(CHECKPOINT, note.to_text().as_bytes())?;
         Ok(note)
+    }
+
+    /// Whether the tree of `size` leaves with `root`, at most the log's size,
+    /// is a prefix of the log's tree: the empty tree's root, the log's own
+    /// root at its size, or a consistency proof from the tiles that checks.
+    fn extends(&self, size: u64, root: &Hash) -> Result<bool> {
+        if size == 0 {
+            return Ok(*root == rfc9162::root(&[]));
+        }
+        if size == self.size() {
+            return Ok(*root == self.root());
+        }
+        let reader = TileHashReader::new(&self.store, self.size(), self.root());
+        let proof = reader
+            .consistency_proof(size)?
+            .ok_or_else(|| Error::OutOfRange(format!("no consistency proof from size {size}")))?;
+        let width =
+            |n: u64| usize::try_from(n).map_err(|_| Error::OutOfRange(format!("tree size {n}")));
+        Ok(rfc9162::verify_consistency(
+            width(size)?,
+            &rfc9162::hex(root),
+            width(self.size())?,
+            &rfc9162::hex(&self.root()),
+            &proof,
+        ))
     }
 
     fn remove_partials(&self, full_path: &str) -> Result<()> {
