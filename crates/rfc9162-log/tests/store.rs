@@ -452,3 +452,59 @@ fn recovery_counts_the_paths_moved_aside() {
         "{moved:?}"
     );
 }
+
+/// A memory store whose next put of an entry bundle fails once armed.
+#[derive(Clone)]
+struct Flaky {
+    inner: MemoryStore,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TileStore for Flaky {
+    fn get(&self, path: &str) -> std::io::Result<Option<Vec<u8>>> {
+        self.inner.get(path)
+    }
+    fn put(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+        if path.starts_with("tile/entries/")
+            && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(std::io::Error::other("injected put failure"));
+        }
+        self.inner.put(path, bytes)
+    }
+    fn create_new(&self, path: &str, bytes: &[u8]) -> std::io::Result<bool> {
+        self.inner.create_new(path, bytes)
+    }
+    fn delete(&self, path: &str) -> std::io::Result<bool> {
+        self.inner.delete(path)
+    }
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+}
+
+#[test]
+fn a_seal_whose_manifest_was_not_logged_is_retried() {
+    let flaky = Flaky {
+        inner: MemoryStore::new(),
+        armed: Arc::default(),
+    };
+    let mut store = Store::open(flaky.clone(), fields()).expect("open");
+    for i in 0..5 {
+        store.append(&entry(i)).expect("append");
+    }
+    // The run file is stored, the bundle carrying its manifest is not.
+    flaky.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(store.seal(), Err(Error::Store(_))));
+    drop(store);
+
+    let mut store = Store::open(flaky.clone(), fields()).expect("reopen");
+    let run = store.seal().expect("seal again");
+    assert_eq!(run.entries, 0..=4);
+    assert_eq!(run.manifest_index, Some(5));
+    let hits = store.find(b"module=m3").expect("find");
+    assert_eq!(hits[0].run.as_ref().map(|r| r.index), Some(5));
+}
