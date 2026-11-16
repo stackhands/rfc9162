@@ -407,3 +407,48 @@ fn a_split_log_keeps_the_data_tree_as_the_entries_alone() {
     assert_eq!(reader.live_runs().len(), 1);
     assert_eq!(reader.find(b"module=m4").expect("find")[0].entry.index, 4);
 }
+
+#[test]
+fn a_sealed_run_is_written_in_format_v3() {
+    let memory = MemoryStore::new();
+    let mut store = Store::open(memory.clone(), fields()).expect("open");
+    for i in 0..5 {
+        store.append(&entry(i)).expect("append");
+    }
+    store.seal().expect("seal");
+    let runs: Vec<String> = memory
+        .list("runs")
+        .expect("list")
+        .into_iter()
+        .filter(|path| path != "runs/live")
+        .collect();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let bytes = memory.get(&runs[0]).expect("get").expect("the run");
+    assert!(bytes.starts_with(rfc9162_log::store::RUN_MAGIC_V3));
+}
+
+#[test]
+fn recovery_counts_the_paths_moved_aside() {
+    let memory = MemoryStore::new();
+    let (size, root) = {
+        let mut store = Store::open(memory.clone(), fields()).expect("open");
+        for i in 0..3 {
+            store.append(&entry(i)).expect("append");
+        }
+        (store.size(), store.root())
+    };
+    // A crash while six more entries went in: their bundle and tile were
+    // written, the tree state was not.
+    memory.put("tile/entries/000.p/9", b"torn").expect("put");
+    memory.put("tile/0/000.p/9", b"torn").expect("put");
+    let mut store = Store::open_trusting(memory.clone(), fields(), size, root).expect("open");
+    let done = store.recover().expect("recover");
+    assert_eq!((done.checkpoint_size, done.replayed), (3, 0));
+    assert_eq!(done.quarantined, 2);
+    let moved = memory.list(".state").expect("list");
+    assert_eq!(
+        moved.iter().filter(|path| path.contains("/torn-")).count(),
+        2,
+        "{moved:?}"
+    );
+}
