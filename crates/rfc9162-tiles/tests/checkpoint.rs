@@ -225,6 +225,44 @@ fn a_log_publishes_a_checkpoint_a_reader_opens() {
 }
 
 #[test]
+fn a_tree_that_does_not_extend_the_published_checkpoint_is_not_signed() {
+    let signer = Signer::new("example.com/log", signing_key(7)).unwrap();
+    let entries = |tag: u8, range: std::ops::Range<u32>| {
+        range.map(move |i| [&[tag][..], &i.to_be_bytes()].concat())
+    };
+    let store = MemoryStore::new();
+    let mut writer = Writer::open(store.clone(), no_keys()).unwrap();
+    writer.checkpoint(&signer, "example.com/log").unwrap();
+    writer.append_batch(entries(0, 0..300)).unwrap();
+    let published = writer
+        .checkpoint(&signer, "example.com/log")
+        .unwrap()
+        .to_text();
+    drop(writer);
+
+    // Other entries in the log's place: neither the tree of the published
+    // size nor a larger one is signed, and the checkpoint stays.
+    let rewritten = MemoryStore::new();
+    let mut other = Writer::open(rewritten.clone(), no_keys()).unwrap();
+    other.append_batch(entries(1, 0..300)).unwrap();
+    rewritten.put(CHECKPOINT, published.as_bytes()).unwrap();
+    let err = other.checkpoint(&signer, "example.com/log").unwrap_err();
+    assert!(matches!(err, Error::Corrupt { .. }), "{err}");
+    other.append_batch(entries(1, 300..400)).unwrap();
+    let err = other.checkpoint(&signer, "example.com/log").unwrap_err();
+    assert!(matches!(err, Error::Corrupt { .. }), "{err}");
+    assert_eq!(
+        rewritten.get(CHECKPOINT).unwrap().unwrap(),
+        published.as_bytes()
+    );
+
+    // The log grown from the published tree is signed.
+    let mut writer = Writer::open(store.clone(), no_keys()).unwrap();
+    writer.append_batch(entries(0, 300..400)).unwrap();
+    writer.checkpoint(&signer, "example.com/log").unwrap();
+}
+
+#[test]
 fn a_cosignature_verifies_over_the_cosignature_lines() {
     let signer = Signer::new("example.com/log", signing_key(5)).unwrap();
     let witness = Cosigner::new("witness.example/w1", signing_key(6)).unwrap();
