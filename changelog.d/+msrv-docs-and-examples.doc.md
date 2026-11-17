@@ -1,0 +1,1 @@
+The install and getting-started docs now state the minimum supported Rust version (1.85) before `cargo add`, and `docs/examples/Cargo.toml` now inherits the workspace `rust-version` so the examples package declares the same compiler floor as the crates.

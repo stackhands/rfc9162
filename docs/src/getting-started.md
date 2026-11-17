@@ -2,7 +2,13 @@
 
 This program hashes three records, checks an inclusion proof for each, then checks that a fourth record is an append. It uses only `rfc9162`. Storage and signatures are the [tutorial](tutorials/build-a-log.md).
 
-Install Rust from the [installation](install/index.md) page, then:
+Install Rust from the [installation](install/index.md) page. `rfc9162` needs Rust 1.85 or newer:
+
+```text
+rustc --version
+```
+
+Then:
 
 ```text
 cargo new ct-log
