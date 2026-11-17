@@ -1,9 +1,10 @@
 //! The sidecar from the command line: init, sync, snapshot, history, tree,
-//! diff and blob over a project directory, with a PEM signing key.
+//! diff, blob and verify over a project directory, with a PEM signing key.
 
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::SigningKey;
+use rfc9162_tiles::{PackStore, Signer, TileStore};
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -70,6 +71,21 @@ fn a_project_is_synced_snapshotted_and_read_back_from_the_shell() {
         snap.starts_with("snapshot example.org/etc size 3 root "),
         "{snap}"
     );
+    let trusted = Signer::new("example.org/etc", SigningKey::from_bytes(&[7u8; 32]))
+        .unwrap()
+        .verifier()
+        .to_text();
+    let verify = ok(&cli(&[
+        "verify",
+        "--dir",
+        p,
+        "--trusted",
+        trusted.as_str(),
+        "--path",
+        "ssh/sshd_config",
+    ]));
+    assert!(verify.contains("verified checkpoint example.org/etc size 3 root "));
+    assert!(verify.contains("verified inclusion ssh/sshd_config index 1 op put steps 2"));
 
     write(&project, "ssh/sshd_config", b"Port 2222\n");
     std::fs::remove_file(project.join("hosts")).unwrap();
@@ -111,6 +127,111 @@ fn a_project_is_synced_snapshotted_and_read_back_from_the_shell() {
     assert_eq!(
         cli(&["blob", "--dir", p, &"0".repeat(64)]).status.code(),
         Some(1)
+    );
+}
+
+#[test]
+fn verify_fails_on_a_tampered_checkpoint_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("etc");
+    std::fs::create_dir_all(&project).unwrap();
+    let p = project.to_str().unwrap();
+    write(&project, "hosts", b"127.0.0.1 localhost\n");
+    let key = dir.path().join("sidecar.pem");
+    std::fs::write(
+        &key,
+        SigningKey::from_bytes(&[8u8; 32])
+            .to_pkcs8_pem(LineEnding::LF)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let k = key.to_str().unwrap();
+    ok(&cli(&["sync", "--dir", p]));
+    ok(&cli(&[
+        "snapshot",
+        "--dir",
+        p,
+        "--key",
+        k,
+        "--origin",
+        "example.org/etc",
+    ]));
+    let trusted = Signer::new("example.org/etc", SigningKey::from_bytes(&[8u8; 32]))
+        .unwrap()
+        .verifier()
+        .to_text();
+
+    {
+        let store = PackStore::open(project.join(".sidecar/pack")).unwrap();
+        let mut tampered = String::from_utf8(store.get("checkpoint").unwrap().unwrap()).unwrap();
+        tampered = tampered.replacen("example.org/etc", "example.org/evil", 1);
+        store.put("checkpoint", tampered.as_bytes()).unwrap();
+    }
+
+    let output = cli(&["verify", "--dir", p, "--trusted", trusted.as_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("signature does not verify"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn verify_fails_on_a_tampered_inclusion_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("etc");
+    std::fs::create_dir_all(&project).unwrap();
+    let p = project.to_str().unwrap();
+    write(&project, "ssh/sshd_config", b"Port 22\n");
+    let key = dir.path().join("sidecar.pem");
+    std::fs::write(
+        &key,
+        SigningKey::from_bytes(&[9u8; 32])
+            .to_pkcs8_pem(LineEnding::LF)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let k = key.to_str().unwrap();
+    ok(&cli(&["sync", "--dir", p]));
+    ok(&cli(&[
+        "snapshot",
+        "--dir",
+        p,
+        "--key",
+        k,
+        "--origin",
+        "example.org/etc",
+    ]));
+    let trusted = Signer::new("example.org/etc", SigningKey::from_bytes(&[9u8; 32]))
+        .unwrap()
+        .verifier()
+        .to_text();
+
+    {
+        let store = PackStore::open(project.join(".sidecar/pack")).unwrap();
+        let entry_paths = store.list("tile/entries").unwrap();
+        let entry_path = entry_paths.first().expect("one bundle path");
+        store.put(entry_path, b"not a bundle").unwrap();
+    }
+
+    let output = cli(&[
+        "verify",
+        "--dir",
+        p,
+        "--trusted",
+        trusted.as_str(),
+        "--path",
+        "ssh/sshd_config",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("verify: read entry")
+            || String::from_utf8_lossy(&output.stderr).contains("verify: find ssh/sshd_config"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
