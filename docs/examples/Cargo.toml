@@ -2,6 +2,7 @@
 name = "rfc9162-docs-examples"
 version = "0.0.0"
 edition = "2021"
+rust-version.workspace = true
 publish = false
 license = "MIT"
 description = "Runnable examples for the rfc9162 documentation"

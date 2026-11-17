@@ -20,6 +20,7 @@ The guide, <https://stackhands.github.io/rfc9162/>, is an mdBook in [`docs/`](do
 ## Install
 
 The three crates share one version. Install the same version of each.
+Minimum supported Rust version (MSRV): Rust 1.85.
 
 ```text
 cargo add rfc9162@0.10.0
