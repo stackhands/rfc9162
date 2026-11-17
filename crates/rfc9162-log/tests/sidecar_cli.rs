@@ -275,3 +275,119 @@ fn a_command_line_it_does_not_take_is_status_2_and_opens_nothing() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn prove_writes_a_proof_that_survives_a_later_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("etc");
+    std::fs::create_dir_all(&project).unwrap();
+    let p = project.to_str().unwrap();
+    write(&project, "hosts", b"127.0.0.1 localhost\n");
+    let key = dir.path().join("sidecar.pem");
+    std::fs::write(
+        &key,
+        SigningKey::from_bytes(&[4u8; 32])
+            .to_pkcs8_pem(LineEnding::LF)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let k = key.to_str().unwrap();
+    ok(&cli(&["sync", "--dir", p]));
+    ok(&cli(&[
+        "snapshot",
+        "--dir",
+        p,
+        "--key",
+        k,
+        "--origin",
+        "example.org/etc",
+    ]));
+    let trusted = Signer::new("example.org/etc", SigningKey::from_bytes(&[4u8; 32]))
+        .unwrap()
+        .verifier()
+        .to_text();
+    let proof_text = ok(&cli(&["prove", "--dir", p, "--path", "hosts"]));
+    let proof: serde_json::Value = serde_json::from_str(&proof_text).unwrap();
+    assert_eq!(proof["path"], "hosts");
+    assert_eq!(proof["op"], "put");
+    assert!(proof["inclusion"].as_array().is_some());
+    assert!(proof["checkpoint"]
+        .as_str()
+        .unwrap()
+        .contains("example.org/etc"));
+    let proof_path = dir.path().join("proof.json");
+    std::fs::write(&proof_path, &proof_text).unwrap();
+    let hosts = project.join("hosts");
+    let checked = ok(&cli(&[
+        "verify-proof",
+        "--proof",
+        proof_path.to_str().unwrap(),
+        "--trusted",
+        trusted.as_str(),
+        "--blob-file",
+        hosts.to_str().unwrap(),
+    ]));
+    assert!(checked.contains("verified proof hosts index "), "{checked}");
+
+    write(&project, "issue", b"later\n");
+    ok(&cli(&["sync", "--dir", p]));
+    ok(&cli(&[
+        "snapshot",
+        "--dir",
+        p,
+        "--key",
+        k,
+        "--origin",
+        "example.org/etc",
+    ]));
+    let again = ok(&cli(&[
+        "verify-proof",
+        "--proof",
+        proof_path.to_str().unwrap(),
+        "--trusted",
+        trusted.as_str(),
+        "--blob-file",
+        hosts.to_str().unwrap(),
+    ]));
+    assert!(again.contains("verified proof hosts"), "{again}");
+
+    let root = proof["root"].as_str().unwrap();
+    let tampered = proof_text.replacen(root, &"0".repeat(root.len()), 1);
+    let bad = dir.path().join("bad.json");
+    std::fs::write(&bad, tampered).unwrap();
+    let output = cli(&[
+        "verify-proof",
+        "--proof",
+        bad.to_str().unwrap(),
+        "--trusted",
+        trusted.as_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+
+    let other = dir.path().join("other");
+    std::fs::write(&other, b"not the hosts file\n").unwrap();
+    let mismatch = cli(&[
+        "verify-proof",
+        "--proof",
+        proof_path.to_str().unwrap(),
+        "--trusted",
+        trusted.as_str(),
+        "--blob-file",
+        other.to_str().unwrap(),
+    ]);
+    assert_eq!(mismatch.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&mismatch.stderr).contains("does not match blob"),
+        "{}",
+        String::from_utf8_lossy(&mismatch.stderr)
+    );
+
+    assert_eq!(cli(&["prove", "--path", "hosts"]).status.code(), Some(2));
+    assert_eq!(
+        cli(&["verify-proof", "--trusted", trusted.as_str()])
+            .status
+            .code(),
+        Some(2)
+    );
+}
