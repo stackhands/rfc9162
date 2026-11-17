@@ -11,6 +11,7 @@
 //! rfc9162-sidecar diff    --dir DIR FROM TO
 //! rfc9162-sidecar blob    --dir DIR HEX [--out FILE]
 //! rfc9162-sidecar include --dir DIR PATH --note FILE --trusted KEYLINE... [--meta K=V]...
+//! rfc9162-sidecar verify  --dir DIR --trusted KEYLINE... [--path REL_PATH]
 //! ```
 //!
 //! Status 0 is done, 2 is a command line this binary does not take, 1 is a
@@ -24,8 +25,8 @@ use std::process::ExitCode;
 
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::SigningKey;
-use rfc9162_log::{Op, Sidecar};
-use rfc9162_tiles::{Checkpoint, Note, PackStore, Signer, Verifier};
+use rfc9162_log::{sidecar::sidecar_keys, store::tiles_keys, Change, Op, Sidecar};
+use rfc9162_tiles::{checkpoint, Checkpoint, Note, PackStore, Reader, Signer, TileStore, Verifier};
 
 const SIDECAR_DIR: &str = ".sidecar";
 
@@ -63,18 +64,25 @@ enum Command {
         note: PathBuf,
         trusted: Vec<Verifier>,
     },
+    Verify {
+        trusted: Vec<Verifier>,
+        path: Option<String>,
+    },
 }
 
 fn usage(what: &str) -> ExitCode {
     eprintln!("rfc9162-sidecar: {what}");
-    eprintln!("usage: rfc9162-sidecar COMMAND --dir DIR [...]; commands: init sync snapshot history tree diff blob include");
+    eprintln!(
+        "usage: rfc9162-sidecar COMMAND --dir DIR [...]; commands: init sync snapshot history tree diff blob include verify"
+    );
     ExitCode::from(2)
 }
 
 fn parse(argv: Vec<String>) -> Result<Args, String> {
     let mut it = argv.into_iter();
     let name = it.next().ok_or("a command is needed")?;
-    let (mut dir, mut key, mut origin, mut note, mut out) = (None, None, None, None, None);
+    let (mut dir, mut key, mut origin, mut note, mut out, mut verify_path) =
+        (None, None, None, None, None, None);
     let (mut skip, mut trusted, mut meta, mut rest) =
         (Vec::new(), Vec::new(), BTreeMap::new(), Vec::new());
     while let Some(arg) = it.next() {
@@ -85,6 +93,7 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--origin" => origin = Some(value("--origin")?),
             "--note" => note = Some(PathBuf::from(value("--note")?)),
             "--out" => out = Some(PathBuf::from(value("--out")?)),
+            "--path" => verify_path = Some(value("--path")?),
             "--skip" => skip.push(value("--skip")?),
             "--trusted" => trusted.push(value("--trusted")?),
             "--meta" => {
@@ -141,6 +150,19 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
                 trusted,
             }
         }
+        "verify" => {
+            if trusted.is_empty() {
+                return Err("--trusted KEYLINE is needed at least once".to_string());
+            }
+            let trusted = trusted
+                .iter()
+                .map(|line| Verifier::parse(line).map_err(|e| format!("--trusted {line:?}: {e}")))
+                .collect::<Result<Vec<_>, _>>()?;
+            Command::Verify {
+                trusted,
+                path: verify_path,
+            }
+        }
         other => return Err(format!("unknown command {other}")),
     };
     Ok(Args {
@@ -159,10 +181,13 @@ fn open(dir: &Path) -> Result<PackStore, String> {
 
 fn run(args: &Args) -> Result<(), String> {
     let dir = args.dir.as_path();
-    let store = open(dir)?;
-    let mut sidecar = Sidecar::open(&store).map_err(|e| format!("sidecar: {e}"))?;
     let out = io::stdout();
     let mut out = out.lock();
+    if let Command::Verify { trusted, path } = &args.command {
+        return verify(dir, trusted, path.as_deref(), &mut out);
+    }
+    let store = open(dir)?;
+    let mut sidecar = Sidecar::open(&store).map_err(|e| format!("sidecar: {e}"))?;
     match &args.command {
         Command::Init => {
             writeln!(
@@ -269,6 +294,84 @@ fn run(args: &Args) -> Result<(), String> {
                 .map_err(|e| format!("include: {e}"))?;
             writeln!(out, "included {path} at {index}").ok();
         }
+        Command::Verify { .. } => unreachable!("verify returns early"),
+    }
+    Ok(())
+}
+
+fn verify(
+    dir: &Path,
+    trusted: &[Verifier],
+    path: Option<&str>,
+    out: &mut impl Write,
+) -> Result<(), String> {
+    let store = open(dir)?;
+    let checkpoint_bytes = store
+        .get("checkpoint")
+        .map_err(|e| format!("verify: read checkpoint: {e}"))?
+        .ok_or("verify: no signed checkpoint in sidecar pack".to_string())?;
+    let checkpoint_text = String::from_utf8(checkpoint_bytes)
+        .map_err(|_| "verify: checkpoint is not UTF-8".to_string())?;
+    let note = Note::parse(&checkpoint_text).map_err(|e| format!("verify: note: {e}"))?;
+    let signed = checkpoint::verify(&note, trusted).map_err(|e| format!("verify: {e}"))?;
+    let checkpoint =
+        Checkpoint::parse(&note.text).map_err(|e| format!("verify: checkpoint: {e}"))?;
+    let root_hex = rfc9162::hex(&checkpoint.root);
+    writeln!(
+        out,
+        "verified checkpoint {} size {} root {} by {} trusted key(s)",
+        checkpoint.origin,
+        checkpoint.size,
+        root_hex,
+        signed.len()
+    )
+    .ok();
+
+    if let Some(path) = path {
+        let keys = sidecar_keys();
+        let reader = Reader::at(&store, checkpoint.size, checkpoint.root, tiles_keys(&keys))
+            .map_err(|e| format!("verify: open reader at checkpoint: {e}"))?;
+        let key = format!("path={path}");
+        let hits = reader
+            .find(key.as_bytes())
+            .map_err(|e| format!("verify: find {path}: {e}"))?;
+        let index = hits.last().copied().ok_or(format!(
+            "verify: no entry for {path} at checkpoint size {}",
+            checkpoint.size
+        ))?;
+        let bytes = reader
+            .get(index)
+            .map_err(|e| format!("verify: read entry {index}: {e}"))?
+            .ok_or(format!("verify: no entry at index {index}"))?;
+        let change: Change = serde_json::from_slice(&bytes)
+            .map_err(|_| format!("verify: entry {index} is not a sidecar change"))?;
+        let inclusion = reader
+            .inclusion(index)
+            .map_err(|e| format!("verify: inclusion {index}: {e}"))?
+            .ok_or(format!("verify: no inclusion proof for index {index}"))?;
+        let proves = rfc9162::verify_inclusion(
+            &rfc9162::leaf_hash(&bytes),
+            index as usize,
+            checkpoint.size as usize,
+            &inclusion,
+            &root_hex,
+        );
+        if !proves {
+            return Err(format!(
+                "verify: inclusion for {path} at index {index} does not verify against checkpoint root"
+            ));
+        }
+        writeln!(
+            out,
+            "verified inclusion {path} index {index} op {} steps {}",
+            match change.op {
+                Op::Put => "put",
+                Op::Delete => "delete",
+                Op::Checkpoint => "checkpoint",
+            },
+            inclusion.len()
+        )
+        .ok();
     }
     Ok(())
 }

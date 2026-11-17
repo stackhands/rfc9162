@@ -91,3 +91,4 @@ The second sync appends the new and changed paths and the deletion at indexes 3,
 `include` reads the child's signed note. `show_checkpoint` in `docs/examples` prints the `checkpoint` record from a pack; a caller that already has the note file skips that step. The trusted line is the child's verifier. The command logs the note at index 0 under `stacks/2026`.
 
 The command reference is the [sidecar page](../reference/sidecar.md).
+Use `verify --trusted KEYLINE` to check the signed checkpoint offline. Add `--path REL_PATH` to verify an inclusion proof for that path against the same trusted checkpoint.
