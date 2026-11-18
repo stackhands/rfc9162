@@ -43,7 +43,7 @@ With no arguments the binary exits 2 and prints:
 
 ```text
 rfc9162-sidecar: a command is needed
-usage: rfc9162-sidecar COMMAND --dir DIR [...]; commands: init sync snapshot history tree diff blob include
+usage: rfc9162-sidecar COMMAND --dir DIR [...]; commands: init sync snapshot history tree diff blob include verify prove verify-proof
 ```
 
 The [log how-to](../howto/rfc9162-log.md) has a full transcript.

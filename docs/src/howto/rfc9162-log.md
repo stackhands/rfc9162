@@ -92,3 +92,5 @@ The second sync appends the new and changed paths and the deletion at indexes 3,
 
 The command reference is the [sidecar page](../reference/sidecar.md).
 Use `verify --trusted KEYLINE` to check the signed checkpoint offline. Add `--path REL_PATH` to verify an inclusion proof for that path against the same trusted checkpoint.
+
+`prove --path REL_PATH` prints a JSON object that carries the checkpoint note, the entry and the inclusion path, so the proof still checks after another snapshot replaces `pack/checkpoint`. `verify-proof --proof FILE --trusted KEYLINE` checks that object without opening the log. `--blob-file FILE` also checks that the file's SHA-256 is the blob named in the object. `--index N` on `prove` selects one entry when the path has several.
