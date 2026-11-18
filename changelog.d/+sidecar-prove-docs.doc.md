@@ -1,1 +1,0 @@
-The sidecar reference and the log how-to describe `prove` and `verify-proof`, including a proof that still checks after a later snapshot.

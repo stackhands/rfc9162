@@ -5,6 +5,52 @@ The crates carry the one workspace version and are released together.
 
 <!-- towncrier release notes start -->
 
+## 0.11.0 (2026-11-17)
+
+### Features
+
+- `rfc9162-sidecar prove` writes a checkpoint and an inclusion proof for one path, and `verify-proof` checks that proof, and an optional blob file, without opening the log.
+
+### Fixes
+
+- A sidecar whose pair count or key length does not fit in its u16 prefix is refused, instead of being written with the length truncated.
+  A bundle of more than 256 entries is refused, because the entry offset is one byte.
+- The tile split no longer overflows when a tree is wider than 2^63.
+  A perfect subtree whose span does not fit in a u64 is refused instead of being accepted or panicking.
+- `rfc9162-log`: A seal or compaction retried after its manifest append failed, or after a crash between storing the run file and logging the manifest, logs the run.
+  It found its own run file and refused every retry with "a run for that entry range is already stored"; a run file with other bytes for the range is still refused.
+- `rfc9162-sidecar`: A command line the binary does not take exits with status 2 and opens nothing: the command and its arguments are checked before `DIR/.sidecar/pack` is opened.
+  An unknown command or a missing argument created the pack, and a non-numeric tree `SIZE`, `include` without `--trusted`, or a `--trusted` line that is not a key exited 1.
+- `rfc9162-tiles`: Opening or refreshing a `PackStore` stops at a record head that declares more bytes than the file holds before sizing a buffer for it.
+  A torn head after a crash cost an allocation of whatever length its bytes claimed, up to 4 GiB.
+- `rfc9162-tiles`: `PosixStore::create_new` writes a temporary file and links it at the path, so a write cut short by an error or a crash leaves nothing there, as the store promises, instead of a partial file that every later `create_new` takes for one already stored.
+  The root must be on a file system with hard links.
+- `rfc9162-tiles`: `PosixStore` handles in one process draw temporary file names from one counter, so two handles on one root no longer write the same temporary file and rename each other's bytes into place.
+  A temporary name that is already taken is passed over rather than truncated, and a temporary file whose write fails is removed.
+- `rfc9162-tiles`: `Writer::checkpoint` signs only a tree that extends the checkpoint already published under its origin: the same root at that size, or a larger tree the tiles prove consistent with it.
+  A tree of the published size with another root, or a larger one that does not extend it, is `Error::Corrupt`, where it was signed.
+
+### Documentation
+
+- The install and getting-started docs now state the minimum supported Rust version (1.85) before `cargo add`, and `docs/examples/Cargo.toml` now inherits the workspace `rust-version` so the examples package declares the same compiler floor as the crates.
+- The sidecar reference and the log how-to describe `prove` and `verify-proof`, including a proof that still checks after a later snapshot.
+- `rfc9162-log`: The `Recovery::quarantined` doc says what it counts: store paths of the data log beyond its tree state that opening the store moved to `.state/torn-<utc>`.
+  It said entries.
+- `rfc9162-log`: The `sidecar` module doc and `sidecar_keys` list every lookup key an entry gets: `path=`, `blob=` for a put, and `origin=` for a child's checkpoint.
+  They left out `origin=`.
+- `rfc9162-log`: The `store` module doc describes the run format the writer writes, v3: front-coded blocks of `BLOCK_PAIRS` pairs behind a block index.
+  It said v2 and pointed at `RUN_MAGIC`, which only readers still accept.
+- `rfc9162`: `Head.root`, `verify_inclusion` and `verify_consistency` say that a root is the lower-case hex `hex` writes: the same root in upper case does not verify, so a head has one form for `Head::material` to sign.
+  They said only "hex".
+
+### Miscellaneous
+
+- Added `rfc9162-sidecar verify` for offline checkpoint verification against trusted signed-note key lines, with optional inclusion proof verification for a path at the signed checkpoint.
+- Inclusion and consistency proofs at sizes 0, 1, 2 and either side of a power of two are checked against a second tree, and a flipped, truncated or extended proof is rejected.
+- `scripts/build-docs.sh` and `docs/examples/sidecar-demo.sh` ask `cargo metadata` for the target directory, so the book's transcripts and API docs come from the builds cargo just made when `CARGO_TARGET_DIR` or a configured target-dir moves them out of `target/`.
+  They read `target/` under the checkout, and ran stale binaries or none; the docs workflow now builds outside the checkout.
+
+
 ## 0.10.0 (2026-11-09)
 
 ### Features
