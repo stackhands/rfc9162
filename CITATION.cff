@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+title: 'rfc9162: an append-only Merkle log after RFC 9162'
+message: If you use rfc9162, please cite it using the metadata below.
+type: software
+authors:
+- given-names: Rohit
+  family-names: Goswami
+  email: rgoswami@ieee.org
+  orcid: https://orcid.org/0000-0002-2393-8056
+license: MIT
+repository-code: https://github.com/stackhands/rfc9162
+url: https://stackhands.github.io/rfc9162/
+keywords:
+- Merkle tree
+- transparency log
+- RFC 9162
+- Ed25519
+abstract: 'Three Rust crates for an append-only Merkle log hashed as RFC 9162: tree
+  hashes and proofs, tlog-tiles storage with Ed25519 signed checkpoints, and an
+  indexed authenticated log with an rfc9162-sidecar CLI.'

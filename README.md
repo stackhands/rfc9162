@@ -23,15 +23,15 @@ The three crates share one version. Install the same version of each.
 Minimum supported Rust version (MSRV): Rust 1.85.
 
 ```text
-cargo add rfc9162@0.10.0
-cargo add rfc9162-tiles@0.10.0
-cargo add rfc9162-log@0.10.0
+cargo add rfc9162@0.11.0
+cargo add rfc9162-tiles@0.11.0
+cargo add rfc9162-log@0.11.0
 ```
 
 `rfc9162-log` installs the sidecar binary:
 
 ```text
-cargo install rfc9162-log --version 0.10.0 --locked
+cargo install rfc9162-log --version 0.11.0 --locked
 ```
 
 ## Specifications
