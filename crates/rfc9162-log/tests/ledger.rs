@@ -96,6 +96,15 @@ fn the_signed_head_verifies_and_fails_when_one_byte_is_flipped() {
     let mut flipped = head.clone();
     flipped.signature = flip_one_signature_byte(&head.signature);
     assert!(flipped.check(&key.verifying_key()).is_err());
+
+    // A tab in the root and a tab in the timestamp have to stay different
+    // bytes. Joining the fields with a raw tab makes these two equal.
+    assert_ne!(
+        ledger::SignedHead::material(1, "a\tb", "c"),
+        ledger::SignedHead::material(1, "a", "b\tc")
+    );
+    let stamped = ledger::SignedHead::sign(head.size, &head.root, &key, "a\tb");
+    stamped.check(&key.verifying_key()).unwrap();
 }
 
 fn flip_one_signature_byte(signature: &str) -> String {
@@ -126,6 +135,24 @@ fn a_key_inside_the_log_dir_is_refused() {
     let outside = root.path().join("key.pem");
     std::fs::write(&outside, pem.as_bytes()).unwrap();
     ledger.sign_with_key(&outside, &log_dir, TS).unwrap();
+
+    let via = log_dir.join("via.pem");
+    std::os::unix::fs::symlink(&outside, &via).unwrap();
+    let error = ledger.sign_with_key(&via, &log_dir, TS).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("symlink inside the log directory"),
+        "{error}"
+    );
+
+    let pointed = root.path().join("pointed.pem");
+    std::os::unix::fs::symlink(&inside, &pointed).unwrap();
+    let error = ledger.sign_with_key(&pointed, &log_dir, TS).unwrap_err();
+    assert!(
+        error.to_string().contains("inside the log directory"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -143,7 +170,11 @@ fn find_returns_the_record_and_its_inclusion_proof() {
             n: 2,
         })
         .unwrap();
-    let found = ledger.find::<Item>(b"name=beta").unwrap();
+    let key = SigningKey::from_bytes(&[8u8; 32]);
+    let head = ledger.sign(&key, TS).unwrap();
+    let found = ledger
+        .find::<Item>(b"name=beta", &head, &key.verifying_key())
+        .unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(
         found[0].record,
@@ -153,6 +184,7 @@ fn find_returns_the_record_and_its_inclusion_proof() {
         }
     );
     assert_eq!(found[0].index, 1);
+    assert_eq!(found[0].located.entry.tree_size, head.size as u64);
     assert!(!found[0].located.entry.path.is_empty());
 
     let line = ledger::seal(&found[0].record, found[0].index).unwrap();
@@ -160,9 +192,9 @@ fn find_returns_the_record_and_its_inclusion_proof() {
     assert!(rfc9162::verify_inclusion(
         &rfc9162::leaf_hash(line.line.as_bytes()),
         found[0].index as usize,
-        found[0].located.entry.tree_size as usize,
+        head.size,
         &found[0].located.entry.path,
-        &rfc9162::hex(&ledger.root()),
+        &head.root,
     ));
 }
 
@@ -253,7 +285,11 @@ fn a_non_finite_float_is_refused_and_the_log_is_unchanged() {
 
     assert_eq!(ledger.size(), size);
     assert_eq!(ledger.root(), root);
-    let found = ledger.find::<Item>(b"name=kept").unwrap();
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let head = ledger.sign(&key, TS).unwrap();
+    let found = ledger
+        .find::<Item>(b"name=kept", &head, &key.verifying_key())
+        .unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].index, 0);
     assert_eq!(
@@ -292,6 +328,33 @@ fn an_old_record_proves_against_the_head_that_covers_it() {
         &head.root,
     ));
     ledger.verify(&head, &key.verifying_key()).unwrap();
+
+    let past = ledger.find::<Item>(b"name=later", &head, &key.verifying_key());
+    let covered = ledger
+        .find::<Item>(b"name=old", &head, &key.verifying_key())
+        .unwrap();
+    let proves = covered.len() == 1
+        && covered[0].index == 0
+        && covered[0].located.entry.tree_size == head.size as u64
+        && rfc9162::verify_inclusion(
+            &rfc9162::leaf_hash(line.line.as_bytes()),
+            0,
+            head.size,
+            &covered[0].located.entry.path,
+            &head.root,
+        );
+    let past_refused = match &past {
+        Err(error) => error.to_string().contains("past the head"),
+        Ok(_) => false,
+    };
+    assert!(
+        past_refused,
+        "find returned a record past the head: {past:?}"
+    );
+    assert!(
+        proves,
+        "the covered record's path does not verify against the head"
+    );
 
     let error = ledger
         .inclusion(1, &head, &key.verifying_key())
@@ -343,5 +406,13 @@ fn a_later_head_extends_an_earlier_one_and_a_fork_does_not() {
     let error = fork
         .consistency(&earlier, &forked, &key.verifying_key())
         .unwrap_err();
-    assert!(error.to_string().contains("does not extend"), "{error}");
+    assert!(error.to_string().contains("does not match"), "{error}");
+
+    let same_size = fork
+        .consistency(&later, &later, &key.verifying_key())
+        .unwrap_err();
+    assert!(
+        same_size.to_string().contains("does not match"),
+        "{same_size}"
+    );
 }

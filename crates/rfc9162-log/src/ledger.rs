@@ -7,26 +7,29 @@
 //! [`SignedHead`] is the size and root, signed with Ed25519 under
 //! [`DOMAIN`].
 //!
-//! The lines are entries of a [`crate::Store`]. Append, find and the
-//! inclusion path are that store's; the leaf hash and the signed bytes are
-//! [`rfc9162`]'s. This module does not keep a second tree, run file or tile
-//! format. [`crate::Sidecar`] is the project-tree log on the same store: a
-//! ledger record is not a path change, so the sidecar's blob names and
-//! checkpoint notes are not copied here.
+//! The lines are entries of a [`crate::Store`]. Append writes the line
+//! there. [`Ledger::find`] answers for one signed head and proves each
+//! record it returns with [`Ledger::inclusion`], over the prefix that head
+//! covers. The leaf hash and the signed bytes are [`rfc9162`]'s. This
+//! module does not keep a second tree, run file or tile format.
+//! [`crate::Sidecar`] is the project-tree log on the same store: a ledger
+//! record is not a path change, so the sidecar's blob names and checkpoint
+//! notes are not copied here.
 //!
 //! A signed head stays a proof root after the log grows.
 //! [`Ledger::inclusion`] is [`rfc9162::inclusion_proof`] over the prefix
-//! that head covers, and [`Ledger::consistency`] is
-//! [`rfc9162::consistency_proof`] between two such heads.
+//! that head covers. [`Ledger::consistency`] checks each head against the
+//! prefix it claims, then [`rfc9162::consistency_proof`] between the two.
 //!
 //! `id`, `index` and `sig` belong to the ledger. A caller's record is the
 //! other fields. The signing key is a path the signer passes in. A key
-//! inside the log directory, or a key with a second hard link, is refused,
-//! so the key never travels with the log.
+//! inside the log directory, a key reached through a symlink in that
+//! directory, or a key with a second hard link, is refused, so the key
+//! never travels with the log.
 
 use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -618,17 +621,25 @@ pub struct SignedHead {
 }
 
 impl SignedHead {
-    /// The bytes the signature covers: [`rfc9162::Head::material`] under
-    /// [`DOMAIN`], a tab, and `ts`.
+    /// The bytes the signature covers.
+    ///
+    /// [`DOMAIN`], the decimal size, `root`, and `ts` are each a big-endian
+    /// `u64` length followed by that field's bytes. A tab, or any other
+    /// byte, inside one field cannot move the next field's boundary.
     #[must_use]
     pub fn material(size: usize, root: &str, ts: &str) -> Vec<u8> {
-        let head = rfc9162::Head {
-            size,
-            root: root.to_string(),
-        };
-        let mut bytes = head.material(DOMAIN);
-        bytes.push(b'\t');
-        bytes.extend_from_slice(ts.as_bytes());
+        let size = size.to_string();
+        let mut bytes = Vec::new();
+        for field in [
+            DOMAIN.as_bytes(),
+            size.as_bytes(),
+            root.as_bytes(),
+            ts.as_bytes(),
+        ] {
+            let len = u64::try_from(field.len()).expect("field length fits in u64");
+            bytes.extend_from_slice(&len.to_be_bytes());
+            bytes.extend_from_slice(field);
+        }
         bytes
     }
 
@@ -685,9 +696,11 @@ fn decode_signature(text: &str) -> Option<[u8; 64]> {
 
 /// Read an Ed25519 PKCS#8 PEM key and refuse one that sits inside `log_dir`.
 ///
-/// A key with a second hard link is refused on platforms that report link
-/// counts: that other name could sit in the log directory, where the path
-/// check cannot see it.
+/// A key reached through a symlink that itself sits in the log directory is
+/// refused too: canonicalizing the path would follow that link out of the
+/// directory and hide it. A key with a second hard link is refused on
+/// platforms that report link counts, since that other name could sit in
+/// the log directory, where the path check cannot see it.
 pub fn load_signing_key(path: &Path, log_dir: &Path) -> Result<SigningKey, Error> {
     let mut file = File::open(path)
         .map_err(|error| Error::Format(format!("read signing key {}: {error}", path.display())))?;
@@ -714,21 +727,83 @@ pub fn load_signing_key(path: &Path, log_dir: &Path) -> Result<SigningKey, Error
 }
 
 /// The resolved key path, or an error when that path is inside `log_dir`.
+///
+/// The key and the log directory are both canonicalized. The key's real
+/// path has to sit outside the log directory's real path. A symlink that
+/// sits inside the log directory is refused as well, even when its target
+/// is outside, because the key was reached through the log's tree.
 fn refuse_key_in_log_dir(key: &Path, log_dir: &Path) -> Result<PathBuf, Error> {
-    let key = key
+    let resolved = key
         .canonicalize()
         .map_err(|error| Error::Format(format!("signing key {}: {error}", key.display())))?;
     let directory = log_dir
         .canonicalize()
         .map_err(|error| Error::Format(format!("log directory {}: {error}", log_dir.display())))?;
-    if key.starts_with(&directory) {
+    if resolved.starts_with(&directory) {
         return Err(Error::Format(format!(
             "signing key {} is inside the log directory {}; keep the key off the log's tree",
+            resolved.display(),
+            directory.display()
+        )));
+    }
+    if symlink_inside_log_dir(key, &directory)? {
+        return Err(Error::Format(format!(
+            "signing key {} is reached through a symlink inside the log directory {}; keep the key off the log's tree",
             key.display(),
             directory.display()
         )));
     }
-    Ok(key)
+    Ok(resolved)
+}
+
+/// Whether walking `key` passes through a symlink that sits inside `directory`.
+///
+/// `directory` is already canonical. Each symlink is judged by where the
+/// link itself is, not by the file it points at. A link outside the log
+/// directory is followed so a later link inside the directory is still seen.
+fn symlink_inside_log_dir(key: &Path, directory: &Path) -> Result<bool, Error> {
+    let mut walked = if key.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| Error::Format(format!("signing key {}: {error}", key.display())))?
+    };
+    for component in key.components() {
+        match component {
+            Component::Prefix(prefix) => walked.push(prefix.as_os_str()),
+            Component::RootDir => walked.push(std::path::MAIN_SEPARATOR_STR),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                walked.pop();
+            }
+            Component::Normal(name) => {
+                walked.push(name);
+                let meta = std::fs::symlink_metadata(&walked).map_err(|error| {
+                    Error::Format(format!("signing key {}: {error}", key.display()))
+                })?;
+                if !meta.file_type().is_symlink() {
+                    continue;
+                }
+                let parent = walked.parent().unwrap_or(Path::new(""));
+                let parent = if parent.as_os_str().is_empty() {
+                    std::env::current_dir().map_err(|error| {
+                        Error::Format(format!("signing key {}: {error}", key.display()))
+                    })?
+                } else {
+                    parent.canonicalize().map_err(|error| {
+                        Error::Format(format!("signing key {}: {error}", key.display()))
+                    })?
+                };
+                if parent.join(name).starts_with(directory) {
+                    return Ok(true);
+                }
+                walked = walked.canonicalize().map_err(|error| {
+                    Error::Format(format!("signing key {}: {error}", key.display()))
+                })?;
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Refuse a second hard link, and a key file that changes while it is read.
@@ -763,7 +838,8 @@ fn check_key_file(
     Ok(())
 }
 
-/// One record a find returned, with the proof the store built.
+/// One record a find returned, with the proof [`Ledger::inclusion`] built
+/// at the signed head that find answered for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found<T> {
     /// Leaf number.
@@ -823,8 +899,8 @@ impl<S: TileStore> Ledger<S> {
         ))
     }
 
-    /// Read the key at `key`, refusing one stored inside `log_dir`, and
-    /// sign the current tree.
+    /// Read the key at `key`, refusing one stored inside `log_dir` or
+    /// reached through a symlink there, and sign the current tree.
     pub fn sign_with_key(&self, key: &Path, log_dir: &Path, ts: &str) -> Result<SignedHead, Error> {
         let key = load_signing_key(key, log_dir)?;
         self.sign(&key, ts)
@@ -838,14 +914,7 @@ impl<S: TileStore> Ledger<S> {
     /// canonical record, fails.
     pub fn verify(&self, head: &SignedHead, trusted: &VerifyingKey) -> Result<(), Error> {
         head.check(trusted)?;
-        let leaves = self.prefix_leaves(head.size)?;
-        let got = rfc9162::Head::over(&leaves);
-        if got.size != head.size || got.root != head.root {
-            return Err(Error::Format(format!(
-                "log root {} does not match the head {}",
-                got.root, head.root
-            )));
-        }
+        self.matches_log(head)?;
         Ok(())
     }
 
@@ -884,12 +953,13 @@ impl<S: TileStore> Ledger<S> {
 
     /// The consistency proof that `later` extends `earlier`.
     ///
-    /// Both heads have to be signed by `trusted`, and `later` has to cover
-    /// a prefix of this log. The proof is [`rfc9162::consistency_proof`]
-    /// between those sizes, checked with [`rfc9162::verify_consistency`].
-    /// An earlier head of size zero is the empty tree: there is no proof
-    /// node, and the empty root plus the later root are checked instead.
-    /// A log that rewrote a record `earlier` covers does not extend it.
+    /// Both heads have to be signed by `trusted`. Each head is checked
+    /// against the prefix of this log it claims to cover before the two
+    /// are compared. The proof is [`rfc9162::consistency_proof`] between
+    /// those sizes, checked with [`rfc9162::verify_consistency`]. An
+    /// earlier head of size zero is the empty tree: there is no proof
+    /// node. A log that rewrote a record either head covers does not
+    /// extend it.
     pub fn consistency(
         &self,
         earlier: &SignedHead,
@@ -904,19 +974,9 @@ impl<S: TileStore> Ledger<S> {
                 earlier.size, later.size
             )));
         }
-        let covered = self.prefix_leaves(later.size)?;
+        self.matches_log(earlier)?;
+        let covered = self.matches_log(later)?;
         if earlier.size == 0 {
-            let empty = rfc9162::hex(&rfc9162::root(&[]));
-            if earlier.root != empty {
-                return Err(Error::Format(
-                    "the earlier head has size 0 but not the empty root".into(),
-                ));
-            }
-            if rfc9162::Head::over(&covered).root != later.root {
-                return Err(Error::Format(
-                    "the log does not hash to the later head".into(),
-                ));
-            }
             return Ok(Vec::new());
         }
         let proof = rfc9162::consistency_proof(&covered, earlier.size).ok_or_else(|| {
@@ -935,6 +995,19 @@ impl<S: TileStore> Ledger<S> {
             )));
         }
         Ok(proof)
+    }
+
+    /// The first `head.size` leaves, or an error when they are not `head`.
+    fn matches_log(&self, head: &SignedHead) -> Result<Vec<[u8; 32]>, Error> {
+        let leaves = self.prefix_leaves(head.size)?;
+        let got = rfc9162::Head::over(&leaves);
+        if got.size != head.size || got.root != head.root {
+            return Err(Error::Format(format!(
+                "log root {} does not match the head {}",
+                got.root, head.root
+            )));
+        }
+        Ok(leaves)
     }
 
     /// Leaf hashes of the first `head_size` lines.
@@ -965,39 +1038,46 @@ impl<S: TileStore> Ledger<S> {
         Ok(leaves)
     }
 
-    /// Records carrying `key`, each with the inclusion proof the store
-    /// returned. The proof is checked against this tree before it is
-    /// returned.
-    pub fn find<T: DeserializeOwned>(&self, key: &[u8]) -> Result<Vec<Found<T>>, Error> {
+    /// Records carrying `key` that `head` covers.
+    ///
+    /// `head` has to be signed by `trusted` and match this log. Each hit
+    /// is proved with [`Self::inclusion`] at `head`'s size, so the path
+    /// verifies against that head and not against a later tree. A hit whose
+    /// index is at or past the head is not returned. When every hit is past
+    /// the head, the call fails with the same error [`Self::inclusion`]
+    /// returns for that index.
+    pub fn find<T: DeserializeOwned>(
+        &self,
+        key: &[u8],
+        head: &SignedHead,
+        trusted: &VerifyingKey,
+    ) -> Result<Vec<Found<T>>, Error> {
+        self.verify(head, trusted)?;
         let located = self.store.find(key)?;
         let view = self.store.index()?;
-        let root = rfc9162::hex(&self.store.root());
-        let tree_size = usize::try_from(self.store.size())
-            .map_err(|_| Error::Format("tree size does not fit".into()))?;
-        let mut found = Vec::with_capacity(located.len());
+        let covered =
+            u64::try_from(head.size).map_err(|_| Error::Format("head size does not fit".into()))?;
+        let mut found = Vec::new();
+        let mut past = None;
         for hit in located {
             let at = hit.entry.index;
+            if at >= covered {
+                past.get_or_insert(at);
+                continue;
+            }
+            let path = self.inclusion(at, head, trusted)?;
+            let run = match hit.run {
+                Some(run) if run.index < covered => Some(crate::Inclusion {
+                    path: self.inclusion(run.index, head, trusted)?,
+                    index: run.index,
+                    tree_size: covered,
+                }),
+                _ => None,
+            };
             let bytes = view
                 .reader()
                 .get(at)?
                 .ok_or_else(|| Error::Format(format!("log has no entry {at}")))?;
-            let index =
-                usize::try_from(at).map_err(|_| Error::Format("index does not fit".into()))?;
-            let proof_size = usize::try_from(hit.entry.tree_size)
-                .map_err(|_| Error::Format("tree size does not fit".into()))?;
-            if proof_size != tree_size
-                || !rfc9162::verify_inclusion(
-                    &rfc9162::leaf_hash(&bytes),
-                    index,
-                    proof_size,
-                    &hit.entry.path,
-                    &root,
-                )
-            {
-                return Err(Error::Format(format!(
-                    "entry {at} is not in the tree of size {tree_size} root {root}"
-                )));
-            }
             let line = std::str::from_utf8(&bytes)
                 .map_err(|_| Error::Format(format!("entry {at} is not UTF-8")))?;
             let parsed = parse_line(line, at)?;
@@ -1005,8 +1085,18 @@ impl<S: TileStore> Ledger<S> {
                 index: parsed.index,
                 id: parsed.id,
                 record: parsed.record,
-                located: hit,
+                located: Located {
+                    entry: crate::Inclusion {
+                        index: at,
+                        tree_size: covered,
+                        path,
+                    },
+                    run,
+                },
             });
+        }
+        if let Some(at) = past.filter(|_| found.is_empty()) {
+            self.inclusion(at, head, trusted)?;
         }
         Ok(found)
     }
