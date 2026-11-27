@@ -23,6 +23,11 @@
 //! same store, a snapshot is a signed checkpoint, and over a
 //! [`rfc9162_tiles::PackStore`] the whole history is one file.
 //!
+//! [`ledger`] is a record log on that same store. A caller-supplied record
+//! becomes one canonical JSON line, the line is the leaf, and an Ed25519
+//! head signs the tree. Lookup and inclusion paths are the store's, the
+//! same ones [`Sidecar`] returns for a path.
+//!
 //! ```
 //! use std::sync::Arc;
 //!
@@ -47,6 +52,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ledger;
 pub mod sidecar;
 pub mod store;
 
