@@ -26,6 +26,10 @@ use std::path::{Path, PathBuf};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::de::DeserializeOwned;
+use serde::ser::{
+    SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
+    SerializeTupleStruct, SerializeTupleVariant, Serializer,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -159,11 +163,13 @@ pub struct Line {
 
 /// Turn a record into the log line for position `index`.
 ///
-/// The record has to serialize as a JSON object. A record that already
-/// carries `index` or `id` must carry the values the ledger would write.
+/// The record has to serialize as a JSON object. A float anywhere in it,
+/// finite or not, is refused. A record that already carries `index` or `id`
+/// must carry the values the ledger would write.
 /// `id`, when present, is checked and then replaced with the id just
 /// computed, so sealing a line that was just parsed yields the same bytes.
 pub fn seal<T: Serialize>(record: &T, index: u64) -> Result<Line, Error> {
+    reject_floats(record)?;
     let value = serde_json::to_value(record).map_err(json_error)?;
     let Value::Object(mut map) = value else {
         return Err(Error::Format("a ledger record is a JSON object".into()));
@@ -188,6 +194,351 @@ pub fn seal<T: Serialize>(record: &T, index: u64) -> Result<Line, Error> {
     map.insert("id".to_string(), Value::from(id.clone()));
     let line = canonical(&Value::Object(map))?;
     Ok(Line { index, id, line })
+}
+
+/// Refuses every `f32` and `f64` in `record`.
+///
+/// `serde_json::to_value` turns `NaN` and infinity into null, and a nested
+/// value is serialized the same way, so [`write_canonical`] never sees the
+/// original float. This walk rejects the float before a line exists.
+fn reject_floats<T: Serialize + ?Sized>(record: &T) -> Result<(), Error> {
+    record
+        .serialize(RejectFloat)
+        .map_err(|seen| Error::Format(seen.0))
+}
+
+/// Why a float was seen, in the same words [`write_canonical`] uses.
+#[derive(Debug)]
+struct FloatSeen(String);
+
+impl std::fmt::Display for FloatSeen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FloatSeen {}
+
+impl serde::ser::Error for FloatSeen {
+    fn custom<T: std::fmt::Display>(message: T) -> Self {
+        Self(message.to_string())
+    }
+}
+
+fn seen_float(number: f64) -> FloatSeen {
+    let shown = serde_json::Number::from_f64(number)
+        .map(|number| number.to_string())
+        .unwrap_or_else(|| number.to_string());
+    FloatSeen(format!("records hold integers only, not {shown}"))
+}
+
+/// A walk that accepts every JSON value except a float.
+struct RejectFloat;
+
+impl RejectFloat {
+    fn allow(self) -> Result<(), FloatSeen> {
+        Ok(())
+    }
+
+    fn walk<T: ?Sized + Serialize>(self, value: &T) -> Result<(), FloatSeen> {
+        value.serialize(self)
+    }
+}
+
+impl Serializer for RejectFloat {
+    type Ok = ();
+    type Error = FloatSeen;
+
+    type SerializeSeq = Self;
+    type SerializeTuple = Self;
+    type SerializeTupleStruct = Self;
+    type SerializeTupleVariant = Self;
+    type SerializeMap = Self;
+    type SerializeStruct = Self;
+    type SerializeStructVariant = Self;
+
+    fn serialize_bool(self, _v: bool) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_i8(self, _v: i8) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_i16(self, _v: i16) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_i32(self, _v: i32) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_i64(self, _v: i64) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_i128(self, _v: i128) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_u8(self, _v: u8) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_u16(self, _v: u16) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_u32(self, _v: u32) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_u64(self, _v: u64) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_u128(self, _v: u128) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_f32(self, number: f32) -> Result<(), FloatSeen> {
+        Err(seen_float(f64::from(number)))
+    }
+
+    fn serialize_f64(self, number: f64) -> Result<(), FloatSeen> {
+        Err(seen_float(number))
+    }
+
+    fn serialize_char(self, _v: char) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_str(self, _v: &str) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_bytes(self, _v: &[u8]) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_none(self) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_some<T>(self, value: &T) -> Result<(), FloatSeen>
+    where
+        T: ?Sized + Serialize,
+    {
+        self.walk(value)
+    }
+
+    fn serialize_unit(self) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+    ) -> Result<(), FloatSeen> {
+        self.allow()
+    }
+
+    fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> Result<(), FloatSeen>
+    where
+        T: ?Sized + Serialize,
+    {
+        self.walk(value)
+    }
+
+    fn serialize_newtype_variant<T>(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        value: &T,
+    ) -> Result<(), FloatSeen>
+    where
+        T: ?Sized + Serialize,
+    {
+        self.walk(value)
+    }
+
+    fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, FloatSeen> {
+        Ok(RejectFloat)
+    }
+
+    fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, FloatSeen> {
+        self.serialize_seq(Some(len))
+    }
+
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        len: usize,
+    ) -> Result<Self::SerializeTupleStruct, FloatSeen> {
+        self.serialize_seq(Some(len))
+    }
+
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        len: usize,
+    ) -> Result<Self::SerializeTupleVariant, FloatSeen> {
+        self.serialize_seq(Some(len))
+    }
+
+    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, FloatSeen> {
+        Ok(RejectFloat)
+    }
+
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        len: usize,
+    ) -> Result<Self::SerializeStruct, FloatSeen> {
+        self.serialize_map(Some(len))
+    }
+
+    fn serialize_struct_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        len: usize,
+    ) -> Result<Self::SerializeStructVariant, FloatSeen> {
+        self.serialize_map(Some(len))
+    }
+}
+
+fn walk_child<T: ?Sized + Serialize>(value: &T) -> Result<(), FloatSeen> {
+    value.serialize(RejectFloat)
+}
+
+impl SerializeSeq for RejectFloat {
+    type Ok = ();
+    type Error = FloatSeen;
+
+    fn serialize_element<T>(&mut self, value: &T) -> Result<(), FloatSeen>
+    where
+        T: ?Sized + Serialize,
+    {
+        walk_child(value)
+    }
+
+    fn end(self) -> Result<(), FloatSeen> {
+        Ok(())
+    }
+}
+
+impl SerializeTuple for RejectFloat {
+    type Ok = ();
+    type Error = FloatSeen;
+
+    fn serialize_element<T>(&mut self, value: &T) -> Result<(), FloatSeen>
+    where
+        T: ?Sized + Serialize,
+    {
+        walk_child(value)
+    }
+
+    fn end(self) -> Result<(), FloatSeen> {
+        Ok(())
+    }
+}
+
+impl SerializeTupleStruct for RejectFloat {
+    type Ok = ();
+    type Error = FloatSeen;
+
+    fn serialize_field<T>(&mut self, value: &T) -> Result<(), FloatSeen>
+    where
+        T: ?Sized + Serialize,
+    {
+        walk_child(value)
+    }
+
+    fn end(self) -> Result<(), FloatSeen> {
+        Ok(())
+    }
+}
+
+impl SerializeTupleVariant for RejectFloat {
+    type Ok = ();
+    type Error = FloatSeen;
+
+    fn serialize_field<T>(&mut self, value: &T) -> Result<(), FloatSeen>
+    where
+        T: ?Sized + Serialize,
+    {
+        walk_child(value)
+    }
+
+    fn end(self) -> Result<(), FloatSeen> {
+        Ok(())
+    }
+}
+
+impl SerializeMap for RejectFloat {
+    type Ok = ();
+    type Error = FloatSeen;
+
+    fn serialize_key<T>(&mut self, key: &T) -> Result<(), FloatSeen>
+    where
+        T: ?Sized + Serialize,
+    {
+        walk_child(key)
+    }
+
+    fn serialize_value<T>(&mut self, value: &T) -> Result<(), FloatSeen>
+    where
+        T: ?Sized + Serialize,
+    {
+        walk_child(value)
+    }
+
+    fn end(self) -> Result<(), FloatSeen> {
+        Ok(())
+    }
+}
+
+impl SerializeStruct for RejectFloat {
+    type Ok = ();
+    type Error = FloatSeen;
+
+    fn serialize_field<T>(&mut self, _key: &'static str, value: &T) -> Result<(), FloatSeen>
+    where
+        T: ?Sized + Serialize,
+    {
+        walk_child(value)
+    }
+
+    fn end(self) -> Result<(), FloatSeen> {
+        Ok(())
+    }
+}
+
+impl SerializeStructVariant for RejectFloat {
+    type Ok = ();
+    type Error = FloatSeen;
+
+    fn serialize_field<T>(&mut self, _key: &'static str, value: &T) -> Result<(), FloatSeen>
+    where
+        T: ?Sized + Serialize,
+    {
+        walk_child(value)
+    }
+
+    fn end(self) -> Result<(), FloatSeen> {
+        Ok(())
+    }
 }
 
 /// A line parsed back into the caller's record.

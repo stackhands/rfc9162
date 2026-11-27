@@ -1,5 +1,6 @@
 //! One behaviour each for the generic ledger.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
@@ -163,4 +164,103 @@ fn find_returns_the_record_and_its_inclusion_proof() {
         &found[0].located.entry.path,
         &rfc9162::hex(&ledger.root()),
     ));
+}
+
+#[derive(Serialize)]
+struct Hold<T> {
+    n: T,
+}
+
+fn one_key<T>(value: T) -> BTreeMap<String, T> {
+    BTreeMap::from([("k".to_string(), value)])
+}
+
+fn refuse_float<T: Serialize>(ledger: &mut Ledger<MemoryStore>, record: &T, place: &str) {
+    match ledger::seal(record, ledger.size()) {
+        Ok(_) => panic!("{place} seal wrote a float"),
+        Err(error) => assert!(
+            error.to_string().contains("records hold integers only"),
+            "{place} seal: {error}"
+        ),
+    }
+    match ledger.append(record) {
+        Ok(_) => panic!("{place} append wrote a float"),
+        Err(error) => assert!(
+            error.to_string().contains("records hold integers only"),
+            "{place} append: {error}"
+        ),
+    }
+}
+
+fn refuse_non_finite_shapes<T: Serialize + Clone>(
+    ledger: &mut Ledger<MemoryStore>,
+    number: T,
+    kind: &str,
+) {
+    refuse_float(
+        ledger,
+        &Hold { n: number.clone() },
+        &format!("{kind} field"),
+    );
+    refuse_float(
+        ledger,
+        &Hold {
+            n: Some(number.clone()),
+        },
+        &format!("{kind} option"),
+    );
+    refuse_float(
+        ledger,
+        &Hold {
+            n: vec![number.clone()],
+        },
+        &format!("{kind} array"),
+    );
+    refuse_float(
+        ledger,
+        &Hold {
+            n: one_key(number.clone()),
+        },
+        &format!("{kind} map"),
+    );
+    refuse_float(
+        ledger,
+        &Hold {
+            n: one_key(vec![Some(number)]),
+        },
+        &format!("{kind} option in array in map"),
+    );
+}
+
+#[test]
+fn a_non_finite_float_is_refused_and_the_log_is_unchanged() {
+    let mut ledger = open();
+    ledger
+        .append(&Item {
+            name: "kept".into(),
+            n: 1,
+        })
+        .unwrap();
+    let size = ledger.size();
+    let root = ledger.root();
+
+    for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        refuse_non_finite_shapes(&mut ledger, number, "f64");
+    }
+    for number in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        refuse_non_finite_shapes(&mut ledger, number, "f32");
+    }
+
+    assert_eq!(ledger.size(), size);
+    assert_eq!(ledger.root(), root);
+    let found = ledger.find::<Item>(b"name=kept").unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].index, 0);
+    assert_eq!(
+        found[0].record,
+        Item {
+            name: "kept".into(),
+            n: 1,
+        }
+    );
 }
