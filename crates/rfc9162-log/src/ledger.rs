@@ -14,6 +14,11 @@
 //! ledger record is not a path change, so the sidecar's blob names and
 //! checkpoint notes are not copied here.
 //!
+//! A signed head stays a proof root after the log grows.
+//! [`Ledger::inclusion`] is [`rfc9162::inclusion_proof`] over the prefix
+//! that head covers, and [`Ledger::consistency`] is
+//! [`rfc9162::consistency_proof`] between two such heads.
+//!
 //! `id`, `index` and `sig` belong to the ledger. A caller's record is the
 //! other fields. The signing key is a path the signer passes in. A key
 //! inside the log directory, or a key with a second hard link, is refused,
@@ -825,24 +830,129 @@ impl<S: TileStore> Ledger<S> {
         self.sign(&key, ts)
     }
 
-    /// Check `head` against `trusted` and against every line in the log.
+    /// Check `head` against `trusted` and against the prefix it covers.
     ///
-    /// A line whose bytes no longer hash to the leaf the tree committed to,
-    /// or a line that is no longer the canonical record, fails.
+    /// A head may be older than the log. A head that covers more records
+    /// than the log has fails. A covered line whose bytes no longer hash to
+    /// the leaf the tree committed to, or a line that is no longer the
+    /// canonical record, fails.
     pub fn verify(&self, head: &SignedHead, trusted: &VerifyingKey) -> Result<(), Error> {
         head.check(trusted)?;
-        let size = self.store.size();
-        let head_size =
-            u64::try_from(head.size).map_err(|_| Error::Format("head size does not fit".into()))?;
-        if size != head_size {
+        let leaves = self.prefix_leaves(head.size)?;
+        let got = rfc9162::Head::over(&leaves);
+        if got.size != head.size || got.root != head.root {
             return Err(Error::Format(format!(
-                "head covers {} records but the log has {size}",
+                "log root {} does not match the head {}",
+                got.root, head.root
+            )));
+        }
+        Ok(())
+    }
+
+    /// The inclusion proof that the record at `index` sits in `head`.
+    ///
+    /// `head` has to be signed by `trusted` and cover `index`. The proof is
+    /// [`rfc9162::inclusion_proof`] over the first `head.size` leaves, and
+    /// it has to verify against that head's root and size. A record past
+    /// the head is refused. Later appends do not change a proof the head
+    /// still covers.
+    pub fn inclusion(
+        &self,
+        index: u64,
+        head: &SignedHead,
+        trusted: &VerifyingKey,
+    ) -> Result<Vec<[u8; 32]>, Error> {
+        head.check(trusted)?;
+        let leaves = self.prefix_leaves(head.size)?;
+        let at = usize::try_from(index).map_err(|_| Error::Format("index does not fit".into()))?;
+        if at >= leaves.len() {
+            return Err(Error::Format(format!(
+                "record {index} is past the head, which covers {} records",
                 head.size
             )));
         }
+        let proof = rfc9162::inclusion_proof(&leaves, at)
+            .ok_or_else(|| Error::Format(format!("no inclusion proof for record {index}")))?;
+        if !rfc9162::verify_inclusion(&leaves[at], at, head.size, &proof, &head.root) {
+            return Err(Error::Format(format!(
+                "record {index} is not in the head of size {} root {}",
+                head.size, head.root
+            )));
+        }
+        Ok(proof)
+    }
+
+    /// The consistency proof that `later` extends `earlier`.
+    ///
+    /// Both heads have to be signed by `trusted`, and `later` has to cover
+    /// a prefix of this log. The proof is [`rfc9162::consistency_proof`]
+    /// between those sizes, checked with [`rfc9162::verify_consistency`].
+    /// An earlier head of size zero is the empty tree: there is no proof
+    /// node, and the empty root plus the later root are checked instead.
+    /// A log that rewrote a record `earlier` covers does not extend it.
+    pub fn consistency(
+        &self,
+        earlier: &SignedHead,
+        later: &SignedHead,
+        trusted: &VerifyingKey,
+    ) -> Result<Vec<[u8; 32]>, Error> {
+        earlier.check(trusted)?;
+        later.check(trusted)?;
+        if earlier.size > later.size {
+            return Err(Error::Format(format!(
+                "the earlier head covers {} records and the later head {}; a log only grows",
+                earlier.size, later.size
+            )));
+        }
+        let covered = self.prefix_leaves(later.size)?;
+        if earlier.size == 0 {
+            let empty = rfc9162::hex(&rfc9162::root(&[]));
+            if earlier.root != empty {
+                return Err(Error::Format(
+                    "the earlier head has size 0 but not the empty root".into(),
+                ));
+            }
+            if rfc9162::Head::over(&covered).root != later.root {
+                return Err(Error::Format(
+                    "the log does not hash to the later head".into(),
+                ));
+            }
+            return Ok(Vec::new());
+        }
+        let proof = rfc9162::consistency_proof(&covered, earlier.size).ok_or_else(|| {
+            Error::Format(format!("no consistency proof from size {}", earlier.size))
+        })?;
+        if !rfc9162::verify_consistency(
+            earlier.size,
+            &earlier.root,
+            later.size,
+            &later.root,
+            &proof,
+        ) {
+            return Err(Error::Format(format!(
+                "the head of size {} root {} does not extend the head of size {} root {}",
+                later.size, later.root, earlier.size, earlier.root
+            )));
+        }
+        Ok(proof)
+    }
+
+    /// Leaf hashes of the first `head_size` lines.
+    ///
+    /// A head wider than the log fails. Each line has to be the canonical
+    /// record at that index, the same check [`verify`](Self::verify) makes.
+    fn prefix_leaves(&self, head_size: usize) -> Result<Vec<[u8; 32]>, Error> {
+        let size = self.store.size();
+        let count =
+            u64::try_from(head_size).map_err(|_| Error::Format("head size does not fit".into()))?;
+        if count > size {
+            return Err(Error::Format(format!(
+                "head covers {count} records but the log has {size}"
+            )));
+        }
         let view = self.store.index()?;
-        let mut leaves = Vec::with_capacity(head.size);
-        for at in 0..size {
+        let mut leaves = Vec::with_capacity(head_size);
+        for at in 0..count {
             let bytes = view
                 .reader()
                 .get(at)?
@@ -852,14 +962,7 @@ impl<S: TileStore> Ledger<S> {
             let parsed = parse_line::<Value>(line, at)?;
             leaves.push(rfc9162::leaf_hash(parsed.line.as_bytes()));
         }
-        let got = rfc9162::Head::over(&leaves);
-        if got.size != head.size || got.root != head.root {
-            return Err(Error::Format(format!(
-                "log root {} does not match the head {}",
-                got.root, head.root
-            )));
-        }
-        Ok(())
+        Ok(leaves)
     }
 
     /// Records carrying `key`, each with the inclusion proof the store

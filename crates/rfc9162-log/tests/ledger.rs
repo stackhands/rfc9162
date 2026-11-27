@@ -264,3 +264,84 @@ fn a_non_finite_float_is_refused_and_the_log_is_unchanged() {
         }
     );
 }
+
+#[test]
+fn an_old_record_proves_against_the_head_that_covers_it() {
+    let mut ledger = open();
+    let key = SigningKey::from_bytes(&[6u8; 32]);
+    let record = Item {
+        name: "old".into(),
+        n: 1,
+    };
+    ledger.append(&record).unwrap();
+    let head = ledger.sign(&key, TS).unwrap();
+    ledger
+        .append(&Item {
+            name: "later".into(),
+            n: 2,
+        })
+        .unwrap();
+
+    let proof = ledger.inclusion(0, &head, &key.verifying_key()).unwrap();
+    let line = ledger::seal(&record, 0).unwrap();
+    assert!(rfc9162::verify_inclusion(
+        &rfc9162::leaf_hash(line.line.as_bytes()),
+        0,
+        head.size,
+        &proof,
+        &head.root,
+    ));
+    ledger.verify(&head, &key.verifying_key()).unwrap();
+
+    let error = ledger
+        .inclusion(1, &head, &key.verifying_key())
+        .unwrap_err();
+    assert!(error.to_string().contains("past the head"), "{error}");
+}
+
+#[test]
+fn a_later_head_extends_an_earlier_one_and_a_fork_does_not() {
+    let mut ledger = open();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    ledger
+        .append(&Item {
+            name: "one".into(),
+            n: 1,
+        })
+        .unwrap();
+    let earlier = ledger.sign(&key, TS).unwrap();
+    ledger
+        .append(&Item {
+            name: "two".into(),
+            n: 2,
+        })
+        .unwrap();
+    let later = ledger.sign(&key, TS).unwrap();
+    let proof = ledger
+        .consistency(&earlier, &later, &key.verifying_key())
+        .unwrap();
+    assert!(rfc9162::verify_consistency(
+        earlier.size,
+        &earlier.root,
+        later.size,
+        &later.root,
+        &proof,
+    ));
+
+    let mut fork = open();
+    fork.append(&Item {
+        name: "other".into(),
+        n: 9,
+    })
+    .unwrap();
+    fork.append(&Item {
+        name: "two".into(),
+        n: 2,
+    })
+    .unwrap();
+    let forked = fork.sign(&key, TS).unwrap();
+    let error = fork
+        .consistency(&earlier, &forked, &key.verifying_key())
+        .unwrap_err();
+    assert!(error.to_string().contains("does not extend"), "{error}");
+}
